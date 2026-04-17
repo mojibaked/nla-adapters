@@ -3,7 +3,8 @@ import {
   defineToolLoopSessionAdapter,
   tool as nlaTool,
   type NlaSessionToolContextBase,
-  type NlaToolLoopModel
+  type NlaToolLoopModel,
+  type NlaToolLoopSessionMemoryStore
 } from "@nla/sdk-core";
 import type { NlaActivityData } from "@nla/protocol";
 import type {
@@ -261,6 +262,7 @@ export interface WalletAgentDependencies {
   readonly storage: Pick<EffectStorageClient, "getJson" | "putJson">;
   readonly signing: SigningCapabilityClient;
   readonly wallet: WalletCapabilityClient;
+  readonly conversationMemory?: NlaToolLoopSessionMemoryStore<{}>;
 }
 
 let currentDependencies: WalletAgentDependencies | undefined;
@@ -735,6 +737,7 @@ export const createWalletAgent = (
     model: () =>
       dependencies.createModel(),
     maxIterations: 6,
+    memory: dependencies.conversationMemory,
     tools: [
       nlaTool<{}, ParsedTransferToolInput, WalletTransferResultOutput>({
         name: TransferSignatureTool.name,
