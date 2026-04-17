@@ -1,0 +1,47 @@
+{
+  "compilerOptions": {
+    "target": "ES2023",
+    "module": "NodeNext",
+    "moduleResolution": "NodeNext",
+    "ignoreDeprecations": "6.0",
+    "types": [
+      "node"
+    ],
+    "baseUrl": ".",
+    "paths": {
+      "@nla-adapters/contracts": [
+        "packages/contracts/src/index.ts"
+      ],
+      "@nla-adapters/claude-cli": [
+        "packages/claude-cli/src/index.ts"
+      ],
+      "@nla-adapters/claude-cli/stdio": [
+        "packages/claude-cli/src/stdio.ts"
+      ],
+      "@nla-adapters/codex-cli": [
+        "packages/codex-cli/src/index.ts"
+      ],
+      "@nla-adapters/codex-cli/stdio": [
+        "packages/codex-cli/src/stdio.ts"
+      ],
+      "@nla-adapters/todo-agent": [
+        "packages/todo-agent/src/index.ts"
+      ],
+      "@nla-adapters/todo-agent/stdio": [
+        "packages/todo-agent/src/stdio.ts"
+      ],
+      "@nla-adapters/wallet-agent": [
+        "packages/wallet-agent/src/index.ts"
+      ],
+      "@nla-adapters/wallet-agent/stdio": [
+        "packages/wallet-agent/src/stdio.ts"
+      ]
+    },
+    "strict": true,
+    "declaration": true,
+    "declarationMap": true,
+    "sourceMap": true,
+    "composite": true,
+    "skipLibCheck": true
+  }
+}

@@ -1,0 +1,34 @@
+{
+  "name": "@nla-adapters/wallet-agent",
+  "version": "0.1.0",
+  "description": "Portable wallet agent for Natural Language Adapters.",
+  "type": "module",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    },
+    "./stdio": {
+      "types": "./dist/stdio.d.ts",
+      "import": "./dist/stdio.js"
+    }
+  },
+  "files": [
+    "dist"
+  ],
+  "scripts": {
+    "build": "tsc -p tsconfig.json"
+  },
+  "dependencies": {
+    "@nla-adapters/contracts": "file:../contracts",
+    "@nla/protocol": "file:../../../nla/packages/protocol",
+    "@nla/sdk-core": "file:../../../nla/packages/sdk-core",
+    "@nla/transport-stdio-jsonl": "file:../../../nla/packages/transport-stdio-jsonl",
+    "@scure/base": "^2.0.0",
+    "@solana/web3.js": "^1.98.4",
+    "effect": "^3.21.0",
+    "viem": "^2.48.0"
+  }
+}

@@ -1,0 +1,20 @@
+{
+  "files": [],
+  "references": [
+    {
+      "path": "./packages/contracts"
+    },
+    {
+      "path": "./packages/codex-cli"
+    },
+    {
+      "path": "./packages/claude-cli"
+    },
+    {
+      "path": "./packages/todo-agent"
+    },
+    {
+      "path": "./packages/wallet-agent"
+    }
+  ]
+}

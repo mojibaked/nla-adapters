@@ -1,0 +1,22 @@
+{
+  "name": "nla-adapters",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Portable Natural Language Adapter packages and capability contracts.",
+  "type": "module",
+  "workspaces": [
+    "packages/*"
+  ],
+  "scripts": {
+    "build": "tsc -b tsconfig.json",
+    "clean": "rm -rf packages/*/dist *.tsbuildinfo packages/*/*.tsbuildinfo",
+    "typecheck": "tsc -b tsconfig.json --pretty false"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "devDependencies": {
+    "@types/node": "^20.19.39",
+    "typescript": "^6.0.2"
+  }
+}
