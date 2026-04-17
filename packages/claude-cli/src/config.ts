@@ -1,3 +1,6 @@
+import os from "node:os";
+import path from "node:path";
+
 export type ClaudeAuthMode = "check" | "skip";
 
 export interface ClaudeAdapterConfig {
@@ -7,6 +10,7 @@ export interface ClaudeAdapterConfig {
   readonly authStatusArgs: ReadonlyArray<string>;
   readonly authLoginArgs: ReadonlyArray<string>;
   readonly childEnv: NodeJS.ProcessEnv;
+  readonly configDir: string;
 }
 
 const DefaultAuthStatusArgs = ["auth", "status", "--json"] as const;
@@ -26,8 +30,14 @@ export const loadClaudeAdapterConfig = (
     env.CLAUDE_ADAPTER_AUTH_LOGIN_ARGS_JSON,
     DefaultAuthLoginArgs
   ),
-  childEnv: { ...env }
+  childEnv: { ...env },
+  configDir: readConfigDir(env)
 });
+
+const readConfigDir = (env: NodeJS.ProcessEnv): string =>
+  env.CLAUDE_ADAPTER_CONFIG_DIR?.trim()
+  || env.CLAUDE_CONFIG_DIR?.trim()
+  || path.join(os.homedir(), ".claude");
 
 const readJsonStringArray = (
   value: string | undefined,

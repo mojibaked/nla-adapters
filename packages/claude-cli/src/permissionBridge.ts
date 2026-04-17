@@ -672,7 +672,7 @@ function acceptedBashPathOperands(command: string): string[] | undefined {
 }
 
 function hasShellControlSyntax(command: string): boolean {
-  return /[;&|<>`]/.test(command) || command.includes("$(");
+  return /[;&|<>`\r\n]/.test(command) || command.includes("$(");
 }
 
 function unwrapAcceptEditsCommand(words: string[]): string[] | undefined {

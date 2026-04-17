@@ -59,10 +59,14 @@ export interface CodexAppServerHandlers {
 export interface CodexTurnState {
   readonly queue: AsyncQueue<CodexTurnEvent>;
   readonly assistantMessageId: string;
-  assistantText: string;
-  finalAssistantText?: string;
+  readonly assistantMessages: Map<string, CodexAssistantMessageState>;
   deltaSequence: number;
   turnId?: string;
+}
+
+export interface CodexAssistantMessageState {
+  text: string;
+  completed: boolean;
 }
 
 export interface CodexSessionState {
@@ -72,6 +76,7 @@ export interface CodexSessionState {
   readonly pendingInputs: Map<string, PendingInputRequest>;
   client?: CodexAppServerClient;
   threadId?: string;
+  resumeThreadRef?: string;
   turnState?: CodexTurnState;
 }
 
@@ -95,10 +100,12 @@ export interface CodexInputResolution {
 export type CodexTurnEvent =
   | {
       readonly type: "assistant.delta";
+      readonly messageId?: string;
       readonly delta: string;
     }
   | {
       readonly type: "assistant.final";
+      readonly messageId?: string;
       readonly text: string;
     }
   | {

@@ -53,6 +53,17 @@ export const assistantTextFromItem = (item: Record<string, unknown>): string | u
     ? stringValue(item.text)
     : undefined;
 
+export const itemId = (item: Record<string, unknown> | undefined): string | undefined =>
+  stringValue(item?.id) ?? stringValue(item?.itemId) ?? stringValue(item?.item_id);
+
+export const agentMessageDeltaId = (params: Record<string, unknown> | undefined): string | undefined => {
+  const item = recordValue(params?.item);
+  return stringValue(params?.itemId)
+    ?? stringValue(params?.item_id)
+    ?? stringValue(params?.id)
+    ?? itemId(item);
+};
+
 export const turnErrorMessage = (turn: Record<string, unknown> | undefined): string | undefined => {
   const error = recordValue(turn?.error);
   return stringValue(error?.message) ?? stringValue(error?.additionalDetails);

@@ -1,4 +1,5 @@
 import { defineAdapter, type NlaAdapterDefinition } from "@nla/sdk-core";
+import { NLA_THREADS_PROFILE_V1 } from "@nla/protocol";
 import { loadCodexAdapterConfig } from "./config.js";
 import { CodexNlaRuntime } from "./runtime.js";
 import type {
@@ -37,7 +38,26 @@ export const createCodexAdapter = (
       sessions: true,
       streaming: true,
       interactions: true,
-      sessionControls: true
+      sessionControls: true,
+      history: true,
+      threads: {
+        list: true,
+        history: true,
+        resume: true
+      }
+    },
+    profiles: {
+      [NLA_THREADS_PROFILE_V1]: {
+        list: true,
+        history: true,
+        attach: true
+      }
+    },
+    threadsList: async (ctx, message) => {
+      await runtime.listThreads(ctx, message);
+    },
+    threadsHistory: async (ctx, message) => {
+      await runtime.getThreadHistory(ctx, message);
     },
     sessionStart: async (ctx, message) => {
       runtime.startOrResumeSession(ctx, message);

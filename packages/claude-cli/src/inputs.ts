@@ -75,53 +75,67 @@ export const buildClaudeQuestionRequest = (input: {
   readonly permissionRequest: UnknownRecord;
 }): {
   readonly request: NlaInteractionPayload;
-  readonly answerKey: string;
+  readonly answerKeys: ReadonlyMap<string, string>;
   readonly optionLabels: ReadonlyMap<string, string>;
 } => {
   const questions = questionList(input.toolInput);
-  const firstQuestion = questions[0];
-  const answerKey =
-    stringValue(firstQuestion?.question) ??
-    stringValue(firstQuestion?.header) ??
-    "response";
+  const normalizedQuestions = questions.length > 0
+    ? questions
+    : [{ question: "response" }];
+  const answerKeys = new Map<string, string>();
+  const optionLabels = new Map<string, string>();
+  const formQuestions = normalizedQuestions.map((question, questionIndex) => {
+    const questionId = normalizedQuestions.length === 1
+      ? input.requestId
+      : `question_${questionIndex + 1}`;
+    const answerKey =
+      stringValue(question?.question) ??
+      stringValue(question?.header) ??
+      `response_${questionIndex + 1}`;
+    answerKeys.set(questionId, answerKey);
 
-  const options = (Array.isArray(firstQuestion?.options) ? firstQuestion.options : [])
-    .flatMap((entry, index) => {
-      const option = recordValue(entry);
-      const label = stringValue(option?.label);
-      return label
-        ? [{
-            id: `option_${index + 1}`,
-            label
-          }]
-        : [];
-    });
+    const options = (Array.isArray(question?.options) ? question.options : [])
+      .flatMap((entry, optionIndex) => {
+        const option = recordValue(entry);
+        const label = stringValue(option?.label);
+        return label
+          ? [{
+              id: normalizedQuestions.length === 1
+                ? `option_${optionIndex + 1}`
+                : `${questionId}_option_${optionIndex + 1}`,
+              label
+            }]
+          : [];
+      });
 
-  const optionLabels = new Map(options.map((option) => [option.id, option.label]));
+    for (const option of options) {
+      optionLabels.set(option.id, option.label);
+    }
+
+    return {
+      id: questionId,
+      title: questionTitle(question),
+      body: questionBody(question),
+      allowsText: true,
+      options: options.map((option, optionIndex) => ({
+        id: option.id,
+        label: option.label,
+        style: optionIndex === 0 ? "primary" : "secondary"
+      }))
+    };
+  });
 
   return {
     request: {
       kind: "form",
       requestId: input.requestId,
-      title: questions.length === 1
-        ? questionTitle(firstQuestion)
+      title: normalizedQuestions.length === 1
+        ? questionTitle(normalizedQuestions[0])
         : "Claude has questions",
-      body: questions.length === 1
-        ? questionBody(firstQuestion)
-        : `${questions.length} questions need answers.`,
-      questions: [
-        {
-          id: input.requestId,
-          title: questionTitle(firstQuestion),
-          body: questionBody(firstQuestion),
-          allowsText: true,
-          options: options.map((option, index) => ({
-            id: option.id,
-            label: option.label,
-            style: index === 0 ? "primary" : "secondary"
-          }))
-        }
-      ],
+      body: normalizedQuestions.length === 1
+        ? questionBody(normalizedQuestions[0])
+        : `${normalizedQuestions.length} questions need answers.`,
+      questions: formQuestions,
       details: {
         provider: "claude",
         toolName: input.toolName,
@@ -131,7 +145,7 @@ export const buildClaudeQuestionRequest = (input: {
         permissionRequest: input.permissionRequest
       }
     },
-    answerKey,
+    answerKeys,
     optionLabels
   };
 };
@@ -170,9 +184,10 @@ export const buildClaudeQuestionResolution = (
   const optionId = stringValue(record.optionId);
   const text = stringValue(record.text);
   const value = recordValue(record.value);
-  const answers = recordValue(value?.answers) ?? answerRecord(
-    pending.answerKey,
-    text || (optionId ? pending.optionLabels.get(optionId) : undefined)
+  const answers = recordValue(value?.answers) ?? answerRecordFromResolution(
+    pending,
+    text,
+    optionId
   );
 
   return preToolUseHookOutput({
@@ -360,6 +375,27 @@ const answerRecord = (key: string, answer: string | undefined): UnknownRecord =>
   answer
     ? { [key]: answer }
     : {};
+
+const answerRecordFromResolution = (
+  pending: PendingClaudeQuestionInput,
+  text: string | undefined,
+  optionId: string | undefined
+): UnknownRecord => {
+  const entries = [...pending.answerKeys.entries()];
+  if (entries.length === 0) {
+    return {};
+  }
+
+  const [firstQuestionId, firstAnswerKey] = entries[0];
+  return answerRecord(
+    firstAnswerKey,
+    text ||
+      (optionId
+        ? pending.optionLabels.get(optionId) ??
+          pending.optionLabels.get(`${firstQuestionId}_${optionId}`)
+        : undefined)
+  );
+};
 
 const preToolUseHookOutput = (input: {
   readonly permissionDecision: "allow" | "deny" | "ask" | "defer";

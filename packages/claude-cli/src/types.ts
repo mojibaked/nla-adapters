@@ -42,10 +42,15 @@ export interface ClaudeTurnState {
   readonly queue: AsyncQueue<ClaudeTurnEvent>;
   readonly assistantMessageId: string;
   turnId?: string;
-  assistantText: string;
-  finalAssistantText?: string;
   providerMessageId?: string;
   activitySequence: number;
+  activeActivities: Map<string, string>;
+  assistantMessages: Map<string, ClaudeAssistantMessageState>;
+}
+
+export interface ClaudeAssistantMessageState {
+  text: string;
+  completed: boolean;
 }
 
 interface PendingClaudeInputBase {
@@ -70,7 +75,7 @@ export interface PendingClaudeQuestionInput extends PendingClaudeInputBase {
   readonly toolName: string;
   readonly toolInput: unknown;
   readonly toolUseId?: string;
-  readonly answerKey: string;
+  readonly answerKeys: ReadonlyMap<string, string>;
   readonly optionLabels: ReadonlyMap<string, string>;
   readonly resolve: (result: UnknownRecord) => void;
 }
@@ -85,6 +90,7 @@ export type ClaudeTurnEvent =
       readonly type: "assistant.final";
       readonly text: string;
       readonly providerMessageId?: string;
+      readonly aggregate?: boolean;
     }
   | {
       readonly type: "activity";
@@ -96,6 +102,11 @@ export type ClaudeTurnEvent =
       readonly type: "interaction.requested";
       readonly status: "awaiting_input" | "awaiting_approval";
       readonly request: NlaInteractionPayload;
+    }
+  | {
+      readonly type: "session.updated";
+      readonly providerRef: string;
+      readonly threadRef: string;
     }
   | {
       readonly type: "turn.completed";

@@ -1,7 +1,10 @@
 import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
 import readline from "node:readline";
 import * as Effect from "effect/Effect";
-import type { NlaSessionHandlerContext } from "@nla/sdk-core";
+import type {
+  NlaSessionHandlerContext,
+  NlaThreadsHandlerContext
+} from "@nla/sdk-core";
 import type {
   NlaSessionControlDefinition,
   NlaSessionControlMessage,
@@ -9,7 +12,9 @@ import type {
   NlaSessionInterruptMessage,
   NlaSessionMessage,
   NlaSessionResumeMessage,
-  NlaSessionStartMessage
+  NlaSessionStartMessage,
+  NlaThreadsHistoryRequestMessage,
+  NlaThreadsListRequestMessage
 } from "@nla/protocol";
 import { checkClaudeAuth } from "./auth.js";
 import {
@@ -28,15 +33,23 @@ import {
 import { parseClaudeOutputLine } from "./notifications.js";
 import { ClaudePermissionBridge, type ClaudePermissionResult } from "./permissionBridge.js";
 import { recordValue, stringValue, type UnknownRecord } from "./shared.js";
+import { getClaudeThreadHistory, listClaudeThreads } from "./threads.js";
 import {
   AsyncQueue,
+  type ClaudeAssistantMessageState,
   ClaudeAdapterError,
   type ClaudeAdapterDependencies,
   DefaultClaudeRuntimeSettings,
   type ClaudeSessionState,
+  type ClaudeTurnEvent,
+  type ClaudeTurnState,
   type PendingClaudeApprovalInput,
   type PendingClaudeQuestionInput
 } from "./types.js";
+
+interface DriveTurnOptions {
+  readonly onFirstEvent?: () => void;
+}
 
 export class ClaudeNlaRuntime {
   private readonly sessions = new Map<string, ClaudeSessionState>();
@@ -69,12 +82,21 @@ export class ClaudeNlaRuntime {
       }
     }
 
+    if ("threadRef" in message.data) {
+      const threadRef = stringValue(message.data.threadRef);
+      if (threadRef) {
+        session.providerRef = threadRef;
+        session.claudeSessionRef = threadRef;
+      }
+    }
+
     session.bridge?.setWorkingDirectory(session.cwd);
     session.bridge?.setPermissionMode(session.settings.permissionMode);
 
     ctx.setProviderRef(session.providerRef);
     ctx.started({
       providerRef: session.providerRef,
+      threadRef: session.claudeSessionRef,
       state: startedState(session)
     });
     ctx.execution({
@@ -85,6 +107,44 @@ export class ClaudeNlaRuntime {
 
   sessionControlsForSession(sessionId: string): ReadonlyArray<NlaSessionControlDefinition> {
     return claudeSessionControls(this.sessionState(sessionId).settings);
+  }
+
+  async listThreads(
+    ctx: NlaThreadsHandlerContext<NlaThreadsListRequestMessage>,
+    message: NlaThreadsListRequestMessage
+  ): Promise<void> {
+    const result = await listClaudeThreads({
+      configDir: this.config.configDir,
+      scope: message.data.scope,
+      cursor: message.data.cursor,
+      limit: message.data.limit
+    });
+
+    for (const thread of result.threads) {
+      ctx.thread(thread);
+    }
+    ctx.complete({
+      nextCursor: result.nextCursor
+    });
+  }
+
+  async getThreadHistory(
+    ctx: NlaThreadsHandlerContext<NlaThreadsHistoryRequestMessage>,
+    message: NlaThreadsHistoryRequestMessage
+  ): Promise<void> {
+    const result = await getClaudeThreadHistory({
+      configDir: this.config.configDir,
+      threadRef: message.data.threadRef,
+      cursor: message.data.cursor,
+      limit: message.data.limit
+    });
+
+    for (const item of result.items) {
+      ctx.historyItem(item);
+    }
+    ctx.complete({
+      nextCursor: result.nextCursor
+    });
   }
 
   async handleTurn(
@@ -119,9 +179,9 @@ export class ClaudeNlaRuntime {
         queue: new AsyncQueue(),
         assistantMessageId,
         turnId: metadataTurnId(message.data.metadata),
-        assistantText: "",
-        finalAssistantText: undefined,
-        activitySequence: 0
+        activitySequence: 0,
+        activeActivities: new Map(),
+        assistantMessages: new Map()
       };
 
       ctx.execution({
@@ -185,7 +245,11 @@ export class ClaudeNlaRuntime {
         interruptible: true
       });
       this.emitMainActivity(ctx, "running", "Resuming Claude");
-      await this.driveTurn(session, ctx);
+      await this.driveTurn(session, ctx, {
+        onFirstEvent: () => {
+          this.emitMainActivity(ctx, "running", "Running Claude");
+        }
+      });
     } catch (error) {
       session.turnState = undefined;
       this.emitMainActivity(ctx, "failed", "Claude failed");
@@ -268,6 +332,10 @@ export class ClaudeNlaRuntime {
       pending.reject(new Error("Claude session stopped"));
     }
     session.pendingInputs.clear();
+
+    session.turnState?.queue.push({
+      type: "interrupted"
+    });
     session.turnState = undefined;
 
     await this.stopChild(session);
@@ -289,7 +357,7 @@ export class ClaudeNlaRuntime {
   }> {
     const session = this.sessions.get(sessionId);
     const turnState = session?.turnState;
-    if (!session || !turnState) {
+    if (!session || !turnState || (turnId && turnState.turnId && turnId !== turnState.turnId)) {
       return {
         status: "no_active_work",
         message: "No active Claude turn"
@@ -310,31 +378,38 @@ export class ClaudeNlaRuntime {
 
     return {
       status: "interrupted",
-      turnId,
+      turnId: turnState.turnId,
       message: "Interrupted"
     };
   }
 
   private async driveTurn(
     session: ClaudeSessionState,
-    ctx: NlaSessionHandlerContext
+    ctx: NlaSessionHandlerContext,
+    options: DriveTurnOptions = {}
   ): Promise<void> {
     const turnState = session.turnState;
     if (!turnState) {
       throw new ClaudeAdapterError("Missing Claude turn state", "claude_missing_turn_state");
     }
 
+    let observedFirstEvent = false;
     while (true) {
       const event = await turnState.queue.next();
+      if (!observedFirstEvent && event.type !== "fatal") {
+        observedFirstEvent = true;
+        options.onFirstEvent?.();
+      }
 
       switch (event.type) {
         case "assistant.delta":
           if (event.providerMessageId) {
             turnState.providerMessageId = event.providerMessageId;
           }
-          turnState.assistantText += event.delta;
+          const deltaMessageId = this.assistantMessageId(turnState, event.providerMessageId);
+          this.assistantMessageState(turnState, deltaMessageId).text += event.delta;
           ctx.messageDelta({
-            messageId: turnState.assistantMessageId,
+            messageId: deltaMessageId,
             role: "assistant",
             delta: event.delta
           });
@@ -343,12 +418,25 @@ export class ClaudeNlaRuntime {
           if (event.providerMessageId) {
             turnState.providerMessageId = event.providerMessageId;
           }
-          turnState.finalAssistantText = event.text;
+          if (event.aggregate && turnState.assistantMessages.size > 0) {
+            continue;
+          }
+          this.completeAssistantMessage(ctx, turnState, event.providerMessageId, event.text);
           continue;
         case "activity":
+          if (event.status !== "running" && !turnState.activeActivities.has(event.activityId)) {
+            continue;
+          }
+          const title = event.status === "running"
+            ? event.title
+            : turnState.activeActivities.get(event.activityId) ?? event.title;
+          this.trackActivity(turnState, {
+            ...event,
+            title
+          });
           ctx.activity({
             activityId: event.activityId,
-            title: event.title,
+            title,
             status: event.status
           });
           continue;
@@ -363,35 +451,131 @@ export class ClaudeNlaRuntime {
             request: event.request
           });
           return;
+        case "session.updated":
+          ctx.setProviderRef(event.providerRef);
+          ctx.started({
+            providerRef: event.providerRef,
+            threadRef: event.threadRef,
+            state: startedState(session)
+          });
+          continue;
         case "turn.completed": {
-          const finalText = turnState.finalAssistantText ?? turnState.assistantText;
           session.turnState = undefined;
 
           if (event.status === "completed") {
+            this.completePendingAssistantMessages(ctx, turnState);
+            this.resolveActiveActivities(ctx, turnState, "succeeded");
             this.emitMainActivity(ctx, "succeeded", "Claude completed");
-            if (finalText) {
-              ctx.emit("session.message", {
-                sessionId: ctx.session.id,
-                role: "assistant",
-                text: finalText
-              }, {
-                id: turnState.assistantMessageId
-              });
-            }
             ctx.complete();
             return;
           }
 
+          this.resolveActiveActivities(ctx, turnState, "failed");
           throw new ClaudeAdapterError(event.message ?? "Claude turn failed", "claude_turn_failed");
         }
         case "interrupted":
+          this.resolveActiveActivities(ctx, turnState, "failed");
           session.turnState = undefined;
           return;
         case "fatal":
+          this.resolveActiveActivities(ctx, turnState, "failed");
           session.turnState = undefined;
           throw event.error;
       }
     }
+  }
+
+  private assistantMessageState(
+    turnState: ClaudeTurnState,
+    messageId = turnState.assistantMessageId
+  ): ClaudeAssistantMessageState {
+    const existing = turnState.assistantMessages.get(messageId);
+    if (existing) {
+      return existing;
+    }
+
+    const created: ClaudeAssistantMessageState = {
+      text: "",
+      completed: false
+    };
+    turnState.assistantMessages.set(messageId, created);
+    return created;
+  }
+
+  private assistantMessageId(
+    turnState: ClaudeTurnState,
+    providerMessageId: string | undefined
+  ): string {
+    if (!providerMessageId || turnState.assistantMessages.has(providerMessageId)) {
+      return providerMessageId ?? turnState.assistantMessageId;
+    }
+
+    const fallback = turnState.assistantMessages.get(turnState.assistantMessageId);
+    return fallback && !fallback.completed
+      ? turnState.assistantMessageId
+      : providerMessageId;
+  }
+
+  private completeAssistantMessage(
+    ctx: NlaSessionHandlerContext,
+    turnState: ClaudeTurnState,
+    providerMessageId: string | undefined,
+    text: string
+  ): void {
+    const messageId = this.assistantMessageId(turnState, providerMessageId);
+    const state = this.assistantMessageState(turnState, messageId);
+    state.text = text;
+
+    if (state.completed) {
+      return;
+    }
+
+    state.completed = true;
+    ctx.emit("session.message", {
+      sessionId: ctx.session.id,
+      role: "assistant",
+      text
+    }, {
+      id: messageId
+    });
+  }
+
+  private completePendingAssistantMessages(
+    ctx: NlaSessionHandlerContext,
+    turnState: ClaudeTurnState
+  ): void {
+    for (const [messageId, message] of turnState.assistantMessages) {
+      if (!message.completed && message.text) {
+        this.completeAssistantMessage(ctx, turnState, messageId, message.text);
+      }
+    }
+  }
+
+  private trackActivity(
+    turnState: ClaudeTurnState,
+    activity: Extract<ClaudeTurnEvent, { readonly type: "activity" }>
+  ): void {
+    if (activity.status === "running") {
+      turnState.activeActivities.set(activity.activityId, activity.title);
+      return;
+    }
+
+    turnState.activeActivities.delete(activity.activityId);
+  }
+
+  private resolveActiveActivities(
+    ctx: NlaSessionHandlerContext,
+    turnState: ClaudeTurnState,
+    status: "succeeded" | "failed"
+  ): void {
+    for (const [activityId, title] of turnState.activeActivities) {
+      ctx.activity({
+        activityId,
+        title,
+        status
+      });
+    }
+    turnState.activeActivities.clear();
   }
 
   private sessionState(sessionId: string): ClaudeSessionState {
@@ -468,14 +652,15 @@ export class ClaudeNlaRuntime {
       this.handleClaudeStderrLine(session, line);
     });
     child.on("error", (error) => {
-      this.handleChildExit(session, new ClaudeAdapterError(
+      this.handleChildExit(session, child, new ClaudeAdapterError(
         `Failed to start Claude CLI: ${error.message}`,
         "claude_start_failed"
       ));
     });
-    child.on("exit", (code, signal) => {
+    child.on("close", (code, signal) => {
       this.handleChildExit(
         session,
+        child,
         code === 0
           ? undefined
           : new ClaudeAdapterError(
@@ -582,7 +767,7 @@ export class ClaudeNlaRuntime {
         toolInput: input.toolInput,
         toolUseId: input.toolUseId,
         permissionRequest: input.permissionRequest,
-        answerKey: question.answerKey,
+        answerKeys: question.answerKeys,
         optionLabels: question.optionLabels,
         resolve,
         reject
@@ -611,6 +796,7 @@ export class ClaudeNlaRuntime {
       return;
     }
 
+    const previousClaudeSessionRef = session.claudeSessionRef;
     if (parsed.claudeSessionRef) {
       session.claudeSessionRef = parsed.claudeSessionRef;
       session.providerRef = parsed.claudeSessionRef;
@@ -619,6 +805,17 @@ export class ClaudeNlaRuntime {
     const turnState = session.turnState;
     if (!turnState) {
       return;
+    }
+
+    if (
+      parsed.claudeSessionRef &&
+      parsed.claudeSessionRef !== previousClaudeSessionRef
+    ) {
+      turnState.queue.push({
+        type: "session.updated",
+        providerRef: parsed.claudeSessionRef,
+        threadRef: parsed.claudeSessionRef
+      });
     }
 
     for (const event of parsed.events) {
@@ -643,8 +840,13 @@ export class ClaudeNlaRuntime {
 
   private handleChildExit(
     session: ClaudeSessionState,
+    child: ChildProcessWithoutNullStreams,
     error?: ClaudeAdapterError
   ): void {
+    if (session.child !== child) {
+      return;
+    }
+
     if (session.stdoutReader) {
       session.stdoutReader.close();
       session.stdoutReader = undefined;
@@ -655,11 +857,16 @@ export class ClaudeNlaRuntime {
     }
     session.child = undefined;
 
-    if (error && session.turnState) {
-      session.turnState.queue.push({
-        type: "fatal",
-        error
-      });
+    if (session.turnState) {
+      session.turnState.queue.push(error
+        ? {
+            type: "fatal",
+            error
+          }
+        : {
+            type: "turn.completed",
+            status: "completed"
+          });
     }
   }
 
@@ -677,15 +884,10 @@ export class ClaudeNlaRuntime {
       return;
     }
 
-    const exited = new Promise<void>((resolve) => {
-      child.once("exit", () => {
-        resolve();
-      });
+    await this.terminateChild(session, child, {
+      termAfterMs: 0,
+      killAfterMs: 1_000
     });
-
-    child.kill("SIGTERM");
-    await exited.catch(() => undefined);
-    this.handleChildExit(session);
   }
 
   private async interruptChild(session: ClaudeSessionState): Promise<void> {
@@ -694,32 +896,42 @@ export class ClaudeNlaRuntime {
       return;
     }
 
-    const exited = new Promise<void>((resolve) => {
-      child.once("exit", () => {
-        resolve();
-      });
-    });
-
     child.kill("SIGINT");
-    const interrupted = await Promise.race([
-      exited.then(() => true),
-      delay(250).then(() => false)
-    ]);
+    const interrupted = await waitForChildClose(child, 250);
 
-    if (!interrupted && child.exitCode === null && !child.killed) {
-      child.kill("SIGTERM");
-      const terminated = await Promise.race([
-        exited.then(() => true),
-        delay(500).then(() => false)
-      ]);
-      if (!terminated && child.exitCode === null && !child.killed) {
-        child.kill("SIGKILL");
-      }
-      await exited.catch(() => undefined);
-      return;
+    if (!interrupted && child.exitCode === null) {
+      await this.terminateChild(session, child, {
+        termAfterMs: 0,
+        killAfterMs: 500
+      });
+    }
+  }
+
+  private async terminateChild(
+    session: ClaudeSessionState,
+    child: ChildProcessWithoutNullStreams,
+    options: {
+      readonly termAfterMs: number;
+      readonly killAfterMs: number;
+    }
+  ): Promise<void> {
+    if (options.termAfterMs > 0) {
+      await waitForChildClose(child, options.termAfterMs);
     }
 
-    await exited.catch(() => undefined);
+    if (child.exitCode === null) {
+      child.kill("SIGTERM");
+    }
+
+    const terminated = await waitForChildClose(child, options.killAfterMs);
+    if (!terminated && child.exitCode === null) {
+      child.kill("SIGKILL");
+      await waitForChildClose(child, 1_000);
+    }
+
+    if (session.child === child) {
+      this.handleChildExit(session, child);
+    }
   }
 
   private emitMainActivity(
@@ -789,3 +1001,27 @@ const delay = (ms: number): Promise<void> =>
   new Promise((resolve) => {
     setTimeout(resolve, ms);
   });
+
+const waitForChildClose = (
+  child: ChildProcessWithoutNullStreams,
+  timeoutMs: number
+): Promise<boolean> => {
+  if (child.exitCode !== null || child.signalCode !== null) {
+    return Promise.resolve(true);
+  }
+
+  return new Promise<boolean>((resolve) => {
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const finish = (closed: boolean): void => {
+      if (timer) {
+        clearTimeout(timer);
+      }
+      child.off("close", onClose);
+      resolve(closed);
+    };
+    const onClose = (): void => finish(true);
+
+    child.once("close", onClose);
+    timer = setTimeout(() => finish(false), timeoutMs);
+  });
+};

@@ -1,5 +1,6 @@
 import * as Effect from "effect/Effect";
 import type { NlaSessionHandlerContext } from "@nla/sdk-core";
+import type { NlaThreadsHandlerContext } from "@nla/sdk-core";
 import type {
   NlaSessionControlDefinition,
   NlaSessionControlMessage,
@@ -7,7 +8,9 @@ import type {
   NlaSessionInterruptMessage,
   NlaSessionMessage,
   NlaSessionResumeMessage,
-  NlaSessionStartMessage
+  NlaSessionStartMessage,
+  NlaThreadsHistoryRequestMessage,
+  NlaThreadsListRequestMessage
 } from "@nla/protocol";
 import {
   createCodexAppServerClient,
@@ -19,8 +22,10 @@ import type { CodexAdapterConfig } from "./config.js";
 import { checkCodexAuth, prepareCodexTurn } from "./inputs.js";
 import { buildCodexResolution, buildInputResponse, buildPendingInputRequest } from "./interactions.js";
 import {
+  agentMessageDeltaId,
   assistantTextFromItem,
   codexActivityFromItem,
+  itemId,
   turnErrorMessage
 } from "./notifications.js";
 import {
@@ -32,12 +37,15 @@ import {
   stringValue,
   toError
 } from "./shared.js";
+import { getCodexThreadHistory, listCodexThreads } from "./threads.js";
 import {
   AsyncQueue,
+  type CodexAssistantMessageState,
   type CodexAdapterDependencies,
   CodexAdapterError,
   type CodexAppServerHandlers,
   type CodexSessionState,
+  type CodexTurnState,
   type CreateCodexAdapterOptions,
   DefaultCodexRuntimeSettings,
   type CodexTurnEvent
@@ -78,12 +86,29 @@ export class CodexNlaRuntime {
 
   startOrResumeSession(
     ctx: NlaSessionHandlerContext,
-    _message: NlaSessionStartMessage | NlaSessionResumeMessage
+    message: NlaSessionStartMessage | NlaSessionResumeMessage
   ): void {
     const session = this.sessionState(ctx.session.id);
+    const resumeThreadRef = "threadRef" in message.data
+      ? stringValue(message.data.threadRef)
+      : undefined;
+    const providerRef = "providerRef" in message.data
+      ? stringValue(message.data.providerRef)
+      : undefined;
+
+    if (providerRef) {
+      session.providerRef = providerRef;
+    }
+    if (resumeThreadRef) {
+      session.providerRef = resumeThreadRef;
+      session.resumeThreadRef = resumeThreadRef;
+      session.threadId = undefined;
+    }
+
     ctx.setProviderRef(session.providerRef);
     ctx.started({
       providerRef: session.providerRef,
+      threadRef: session.resumeThreadRef ?? session.threadId,
       state: {
         approvalMode: session.settings.approvalMode,
         sandboxMode: session.settings.sandboxMode
@@ -92,6 +117,46 @@ export class CodexNlaRuntime {
     ctx.execution({
       state: "idle",
       interruptible: false
+    });
+  }
+
+  async listThreads(
+    ctx: NlaThreadsHandlerContext<NlaThreadsListRequestMessage>,
+    message: NlaThreadsListRequestMessage
+  ): Promise<void> {
+    const result = await listCodexThreads({
+      configDir: this.config.configDir,
+      scope: message.data.scope,
+      cursor: message.data.cursor,
+      limit: message.data.limit
+    });
+
+    for (const thread of result.threads) {
+      ctx.thread(thread);
+    }
+
+    ctx.complete({
+      nextCursor: result.nextCursor
+    });
+  }
+
+  async getThreadHistory(
+    ctx: NlaThreadsHandlerContext<NlaThreadsHistoryRequestMessage>,
+    message: NlaThreadsHistoryRequestMessage
+  ): Promise<void> {
+    const result = await getCodexThreadHistory({
+      configDir: this.config.configDir,
+      threadRef: message.data.threadRef,
+      cursor: message.data.cursor,
+      limit: message.data.limit
+    });
+
+    for (const item of result.items) {
+      ctx.historyItem(item);
+    }
+
+    ctx.complete({
+      nextCursor: result.nextCursor
     });
   }
 
@@ -138,8 +203,7 @@ export class CodexNlaRuntime {
       session.turnState = {
         queue: new AsyncQueue<CodexTurnEvent>(),
         assistantMessageId,
-        assistantText: "",
-        finalAssistantText: undefined,
+        assistantMessages: new Map(),
         deltaSequence: 0
       };
 
@@ -356,15 +420,15 @@ export class CodexNlaRuntime {
       switch (event.type) {
         case "assistant.delta":
           turnState.deltaSequence += 1;
-          turnState.assistantText += event.delta;
+          this.assistantMessageState(turnState, event.messageId).text += event.delta;
           ctx.messageDelta({
-            messageId: turnState.assistantMessageId,
+            messageId: event.messageId ?? turnState.assistantMessageId,
             role: "assistant",
             delta: event.delta
           });
           continue;
         case "assistant.final":
-          turnState.finalAssistantText = event.text;
+          this.completeAssistantMessage(ctx, turnState, event.messageId, event.text);
           continue;
         case "activity":
           ctx.activity({
@@ -395,20 +459,11 @@ export class CodexNlaRuntime {
           return;
         }
         case "turn.completed": {
-          const finalText = turnState.finalAssistantText ?? turnState.assistantText;
           session.turnState = undefined;
 
           if (event.status === "completed") {
+            this.completePendingAssistantMessages(ctx, turnState);
             this.emitMainActivity(ctx, "succeeded", "Codex completed");
-            if (finalText) {
-              ctx.emit("session.message", {
-                sessionId: ctx.session.id,
-                role: "assistant",
-                text: finalText
-              }, {
-                id: turnState.assistantMessageId
-              });
-            }
             ctx.complete();
             return;
           }
@@ -486,19 +541,28 @@ export class CodexNlaRuntime {
       return;
     }
 
-    const response = await client.request("thread/start", {
-      cwd,
-      approvalPolicy: session.settings.approvalMode,
-      sandbox: session.settings.sandboxMode,
-      experimentalRawEvents: false,
-      persistExtendedHistory: false
-    });
+    const response = session.resumeThreadRef
+      ? await client.request("thread/resume", {
+          threadId: session.resumeThreadRef,
+          cwd,
+          approvalPolicy: session.settings.approvalMode,
+          sandbox: session.settings.sandboxMode,
+          persistExtendedHistory: false
+        })
+      : await client.request("thread/start", {
+          cwd,
+          approvalPolicy: session.settings.approvalMode,
+          sandbox: session.settings.sandboxMode,
+          experimentalRawEvents: false,
+          persistExtendedHistory: false
+        });
     const threadId = readThreadId(response);
     if (!threadId) {
       throw new CodexAdapterError("Codex app-server did not return a thread id", "codex_missing_thread");
     }
 
     session.threadId = threadId;
+    session.providerRef = threadId;
   }
 
   private handleNotification(
@@ -520,6 +584,7 @@ export class CodexNlaRuntime {
         if (delta && session.turnState) {
           session.turnState.queue.push({
             type: "assistant.delta",
+            messageId: agentMessageDeltaId(params),
             delta
           });
         }
@@ -544,6 +609,7 @@ export class CodexNlaRuntime {
         if (assistantText && message.method === "item/completed") {
           session.turnState.queue.push({
             type: "assistant.final",
+            messageId: itemId(item),
             text: assistantText
           });
         }
@@ -578,6 +644,58 @@ export class CodexNlaRuntime {
         return;
       default:
         return;
+    }
+  }
+
+  private assistantMessageState(
+    turnState: CodexTurnState,
+    messageId = turnState.assistantMessageId
+  ): CodexAssistantMessageState {
+    const existing = turnState.assistantMessages.get(messageId);
+    if (existing) {
+      return existing;
+    }
+
+    const created: CodexAssistantMessageState = {
+      text: "",
+      completed: false
+    };
+    turnState.assistantMessages.set(messageId, created);
+    return created;
+  }
+
+  private completeAssistantMessage(
+    ctx: NlaSessionHandlerContext,
+    turnState: CodexTurnState,
+    messageId: string | undefined,
+    text: string
+  ): void {
+    const resolvedMessageId = messageId ?? turnState.assistantMessageId;
+    const state = this.assistantMessageState(turnState, resolvedMessageId);
+    state.text = text;
+
+    if (state.completed) {
+      return;
+    }
+
+    state.completed = true;
+    ctx.emit("session.message", {
+      sessionId: ctx.session.id,
+      role: "assistant",
+      text
+    }, {
+      id: resolvedMessageId
+    });
+  }
+
+  private completePendingAssistantMessages(
+    ctx: NlaSessionHandlerContext,
+    turnState: CodexTurnState
+  ): void {
+    for (const [messageId, message] of turnState.assistantMessages) {
+      if (!message.completed && message.text) {
+        this.completeAssistantMessage(ctx, turnState, messageId, message.text);
+      }
     }
   }
 

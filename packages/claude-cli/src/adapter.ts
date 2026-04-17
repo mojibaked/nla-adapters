@@ -1,5 +1,8 @@
 import { defineAdapter, type NlaAdapterDefinition } from "@nla/sdk-core";
-import type { NlaSessionInterruptMessage } from "@nla/protocol";
+import {
+  NLA_THREADS_PROFILE_V1,
+  type NlaSessionInterruptMessage
+} from "@nla/protocol";
 import { loadClaudeAdapterConfig } from "./config.js";
 import { ClaudeNlaRuntime } from "./runtime.js";
 import type {
@@ -33,7 +36,26 @@ export const createClaudeAdapter = (
       sessions: true,
       streaming: true,
       interactions: true,
-      sessionControls: true
+      sessionControls: true,
+      history: true,
+      threads: {
+        list: true,
+        history: true,
+        resume: true
+      }
+    },
+    profiles: {
+      [NLA_THREADS_PROFILE_V1]: {
+        list: true,
+        history: true,
+        attach: true
+      }
+    },
+    threadsList: async (ctx, message) => {
+      await runtime.listThreads(ctx, message);
+    },
+    threadsHistory: async (ctx, message) => {
+      await runtime.getThreadHistory(ctx, message);
     },
     sessionStart: async (ctx, message) => {
       runtime.startOrResumeSession(ctx, message);

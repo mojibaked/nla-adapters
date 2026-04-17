@@ -1,3 +1,6 @@
+import { homedir } from "node:os";
+import path from "node:path";
+
 export type CodexAuthMode = "check" | "skip";
 
 export interface CodexAdapterConfig {
@@ -6,6 +9,7 @@ export interface CodexAdapterConfig {
   readonly appServerArgs: ReadonlyArray<string>;
   readonly authMode: CodexAuthMode;
   readonly authStatusArgs: ReadonlyArray<string>;
+  readonly configDir: string;
   readonly childEnv: NodeJS.ProcessEnv;
 }
 
@@ -23,6 +27,9 @@ export const loadCodexAdapterConfig = (
     env.CODEX_ADAPTER_AUTH_STATUS_ARGS_JSON,
     DefaultAuthStatusArgs
   ),
+  configDir: env.CODEX_ADAPTER_CONFIG_DIR?.trim() ||
+    env.CODEX_HOME?.trim() ||
+    path.join(homedir(), ".codex"),
   childEnv: { ...env }
 });
 
