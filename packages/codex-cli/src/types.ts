@@ -6,6 +6,7 @@ import type {
   CodexAppServerRequestMessage
 } from "./appServerClient.js";
 import type { CodexAdapterConfig } from "./config.js";
+import type { CodexActivityStatus, CodexExplorationAction } from "./notifications.js";
 
 export interface CodexTextInput {
   readonly type: "text";
@@ -60,8 +61,28 @@ export interface CodexTurnState {
   readonly queue: AsyncQueue<CodexTurnEvent>;
   readonly assistantMessageId: string;
   readonly assistantMessages: Map<string, CodexAssistantMessageState>;
+  readonly explorationItemGroups: Map<string, CodexExplorationGroup>;
+  readonly reasoningSummaries: Map<string, CodexReasoningSummaryState>;
+  readonly hostTurnId?: string;
+  explorationGroupSequence: number;
+  currentExplorationGroup?: CodexExplorationGroup;
   deltaSequence: number;
   turnId?: string;
+}
+
+export interface CodexExplorationCall {
+  readonly itemId: string;
+  actions: ReadonlyArray<CodexExplorationAction>;
+  status: CodexActivityStatus;
+}
+
+export interface CodexExplorationGroup {
+  readonly activityId: string;
+  readonly calls: CodexExplorationCall[];
+}
+
+export interface CodexReasoningSummaryState {
+  readonly parts: string[];
 }
 
 export interface CodexAssistantMessageState {
@@ -112,7 +133,7 @@ export type CodexTurnEvent =
       readonly type: "activity";
       readonly activityId: string;
       readonly title: string;
-      readonly status: "running" | "succeeded" | "failed";
+      readonly status: CodexActivityStatus;
     }
   | {
       readonly type: "server.request";

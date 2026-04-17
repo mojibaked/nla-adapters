@@ -25,7 +25,16 @@ import {
   agentMessageDeltaId,
   assistantTextFromItem,
   codexActivityFromItem,
+  codexExplorationFromItem,
+  codexExplorationTitle,
+  codexReasoningActivityId,
+  codexReasoningSummaryDeltaFromParams,
+  codexReasoningSummaryFromItem,
+  codexReasoningTitle,
   itemId,
+  type CodexActivity,
+  type CodexExplorationItem,
+  type CodexReasoningSummaryDelta,
   turnErrorMessage
 } from "./notifications.js";
 import {
@@ -44,6 +53,7 @@ import {
   type CodexAdapterDependencies,
   CodexAdapterError,
   type CodexAppServerHandlers,
+  type CodexExplorationGroup,
   type CodexSessionState,
   type CodexTurnState,
   type CreateCodexAdapterOptions,
@@ -176,17 +186,12 @@ export class CodexNlaRuntime {
 
     const assistantMessageId = metadataString(message.data.metadata, "assistantMessageId")
       ?? ctx.createId("msg");
+    const hostTurnId = metadataString(message.data.metadata, "turnId");
 
     try {
       const input = await Effect.runPromise(
         prepareCodexTurn(this.dependencies.assets, message.data)
       );
-      ctx.execution({
-        state: "running",
-        turnId: metadataString(message.data.metadata, "turnId"),
-        interruptible: true
-      });
-      this.emitMainActivity(ctx, "running", "Running Codex");
 
       if (this.config.authMode === "check") {
         const authenticated = await Effect.runPromise(checkCodexAuth(this.config, input.cwd));
@@ -204,8 +209,18 @@ export class CodexNlaRuntime {
         queue: new AsyncQueue<CodexTurnEvent>(),
         assistantMessageId,
         assistantMessages: new Map(),
+        explorationItemGroups: new Map(),
+        reasoningSummaries: new Map(),
+        hostTurnId,
+        explorationGroupSequence: 0,
         deltaSequence: 0
       };
+      ctx.execution({
+        state: "running",
+        turnId: hostTurnId,
+        interruptible: true
+      });
+      this.emitMainActivity(ctx, "running", "Running Codex");
 
       const response = await client.request("turn/start", {
         threadId: this.requireThreadId(session),
@@ -253,7 +268,7 @@ export class CodexNlaRuntime {
       });
       ctx.execution({
         state: "running",
-        turnId: turnState.turnId ?? metadataString(message.data.metadata, "turnId"),
+        turnId: turnState.hostTurnId ?? metadataString(message.data.metadata, "turnId"),
         interruptible: true
       });
       this.emitMainActivity(ctx, "running", "Resuming Codex");
@@ -376,7 +391,7 @@ export class CodexNlaRuntime {
   }> {
     const session = this.sessions.get(sessionId);
     const turnState = session?.turnState;
-    if (!session || !turnState || (turnId && turnState.turnId && turnId !== turnState.turnId)) {
+    if (!session || !turnState || !this.matchesActiveTurn(turnState, turnId)) {
       return {
         status: "no_active_work",
         message: "No active Codex turn"
@@ -400,7 +415,7 @@ export class CodexNlaRuntime {
 
     return {
       status: "interrupted",
-      turnId: turnState.turnId,
+      turnId: turnState.hostTurnId ?? turnState.turnId,
       message: "Interrupted"
     };
   }
@@ -449,7 +464,7 @@ export class CodexNlaRuntime {
           session.pendingInputs.set(pending.requestId, pending);
           ctx.execution({
             state: "awaiting_input",
-            turnId: turnState.turnId,
+            turnId: turnState.hostTurnId ?? turnState.turnId,
             interruptible: true
           });
           this.emitMainActivity(ctx, "running", "Codex is waiting for input");
@@ -498,6 +513,150 @@ export class CodexNlaRuntime {
     };
     this.sessions.set(sessionId, created);
     return created;
+  }
+
+  private matchesActiveTurn(turnState: CodexTurnState, requestedTurnId?: string): boolean {
+    if (!requestedTurnId) {
+      return true;
+    }
+
+    return requestedTurnId === turnState.hostTurnId || requestedTurnId === turnState.turnId;
+  }
+
+  private activityFromItem(
+    turnState: CodexTurnState,
+    item: Record<string, unknown>,
+    started: boolean
+  ): Extract<CodexTurnEvent, { readonly type: "activity" }> | undefined {
+    const exploration = codexExplorationFromItem(item, started);
+    const reasoning = exploration
+      ? undefined
+      : this.reasoningActivityFromItem(turnState, item, started);
+    const activity = exploration
+      ? this.updateExplorationGroup(turnState, exploration)
+      : reasoning ?? codexActivityFromItem(item, started);
+
+    if (!exploration && activity) {
+      this.closeExplorationGroup(turnState);
+    }
+
+    return activity
+      ? {
+          type: "activity",
+          ...activity
+        }
+      : undefined;
+  }
+
+  private updateExplorationGroup(
+    turnState: CodexTurnState,
+    item: CodexExplorationItem
+  ): CodexActivity {
+    let group = turnState.explorationItemGroups.get(item.itemId);
+    const existingCall = group?.calls.find((call) => call.itemId === item.itemId);
+
+    if (group && existingCall) {
+      existingCall.actions = item.actions;
+      existingCall.status = item.status;
+    } else {
+      group = group ?? turnState.currentExplorationGroup ?? this.createExplorationGroup(turnState);
+      group.calls.push({
+        itemId: item.itemId,
+        actions: item.actions,
+        status: item.status
+      });
+      turnState.explorationItemGroups.set(item.itemId, group);
+    }
+
+    const status = this.explorationGroupStatus(group);
+    turnState.currentExplorationGroup = status === "failed" ? undefined : group;
+
+    return {
+      activityId: group.activityId,
+      title: codexExplorationTitle(
+        group.calls.flatMap((call) => call.actions),
+        status
+      ),
+      status
+    };
+  }
+
+  private reasoningActivityFromItem(
+    turnState: CodexTurnState,
+    item: Record<string, unknown>,
+    started: boolean
+  ): CodexActivity | undefined {
+    if (started) {
+      return undefined;
+    }
+
+    if (stringValue(item.type) !== "reasoning") {
+      return undefined;
+    }
+
+    const reasoningItemId = itemId(item);
+    if (!reasoningItemId) {
+      return undefined;
+    }
+
+    const summary = codexReasoningSummaryFromItem(item) ?? this.reasoningSummaryText(turnState, reasoningItemId);
+    turnState.reasoningSummaries.delete(reasoningItemId);
+    if (!summary) {
+      return undefined;
+    }
+
+    return {
+      activityId: codexReasoningActivityId(reasoningItemId),
+      title: codexReasoningTitle(summary, "succeeded"),
+      status: "succeeded"
+    };
+  }
+
+  private updateReasoningSummary(
+    turnState: CodexTurnState,
+    delta: CodexReasoningSummaryDelta
+  ): CodexActivity {
+    const summary = turnState.reasoningSummaries.get(delta.itemId) ?? { parts: [] };
+    summary.parts[delta.summaryIndex] = `${summary.parts[delta.summaryIndex] ?? ""}${delta.delta}`;
+    turnState.reasoningSummaries.set(delta.itemId, summary);
+
+    return {
+      activityId: codexReasoningActivityId(delta.itemId),
+      title: codexReasoningTitle(this.reasoningSummaryText(turnState, delta.itemId) ?? "", "running"),
+      status: "running"
+    };
+  }
+
+  private reasoningSummaryText(turnState: CodexTurnState, itemId: string): string | undefined {
+    const summary = turnState.reasoningSummaries.get(itemId);
+    const text = summary?.parts
+      .filter((part) => Boolean(part?.trim()))
+      .map((part) => part.trim())
+      .join(" ");
+
+    return text || undefined;
+  }
+
+  private createExplorationGroup(turnState: CodexTurnState): CodexExplorationGroup {
+    turnState.explorationGroupSequence += 1;
+    return {
+      activityId: `codex-exploring:${turnState.hostTurnId ?? turnState.turnId ?? "turn"}:${turnState.explorationGroupSequence}`,
+      calls: []
+    };
+  }
+
+  private closeExplorationGroup(turnState: CodexTurnState): void {
+    turnState.currentExplorationGroup = undefined;
+  }
+
+  private explorationGroupStatus(group: CodexExplorationGroup): CodexActivity["status"] {
+    if (group.calls.some((call) => call.status === "failed")) {
+      return "failed";
+    }
+    if (group.calls.some((call) => call.status === "running")) {
+      return "running";
+    }
+    return "succeeded";
   }
 
   private async ensureClient(session: CodexSessionState): Promise<CodexAppServerClient> {
@@ -582,6 +741,7 @@ export class CodexNlaRuntime {
       case "item/agentMessage/delta": {
         const delta = stringValue(params?.delta);
         if (delta && session.turnState) {
+          this.closeExplorationGroup(session.turnState);
           session.turnState.queue.push({
             type: "assistant.delta",
             messageId: agentMessageDeltaId(params),
@@ -590,6 +750,20 @@ export class CodexNlaRuntime {
         }
         return;
       }
+      case "item/reasoning/summaryTextDelta": {
+        const delta = codexReasoningSummaryDeltaFromParams(params);
+        if (delta && session.turnState) {
+          this.closeExplorationGroup(session.turnState);
+          session.turnState.queue.push({
+            type: "activity",
+            ...this.updateReasoningSummary(session.turnState, delta)
+          });
+        }
+        return;
+      }
+      case "item/reasoning/summaryPartAdded":
+      case "item/reasoning/textDelta":
+        return;
       case "item/started":
       case "item/completed": {
         const item = recordValue(params?.item);
@@ -597,16 +771,18 @@ export class CodexNlaRuntime {
           return;
         }
 
-        const activity = codexActivityFromItem(item, message.method === "item/started");
+        const activity = this.activityFromItem(
+          session.turnState,
+          item,
+          message.method === "item/started"
+        );
         if (activity) {
-          session.turnState.queue.push({
-            type: "activity",
-            ...activity
-          });
+          session.turnState.queue.push(activity);
         }
 
         const assistantText = assistantTextFromItem(item);
         if (assistantText && message.method === "item/completed") {
+          this.closeExplorationGroup(session.turnState);
           session.turnState.queue.push({
             type: "assistant.final",
             messageId: itemId(item),
