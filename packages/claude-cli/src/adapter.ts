@@ -29,7 +29,7 @@ export const createClaudeAdapter = (
     id: "claude.cli",
     name: "Claude CLI Adapter",
     description: [
-      "Process-backed Claude adapter using `claude -p` over stream-json.",
+      "Process-backed Claude adapter using Claude stream-json sessions.",
       "Authored directly as an NLA session adapter."
     ].join(" "),
     capabilities: {

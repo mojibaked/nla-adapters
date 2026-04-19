@@ -23,6 +23,10 @@ export const claudeSessionControls = (
         label: "Accept Edits"
       },
       {
+        id: "acceptAll",
+        label: "Auto Approve Everything"
+      },
+      {
         id: "plan",
         label: "Plan"
       }
@@ -36,6 +40,7 @@ export const parseClaudePermissionMode = (
   switch (value?.trim()) {
     case "default":
     case "acceptEdits":
+    case "acceptAll":
     case "plan":
       return value.trim() as ClaudePermissionMode;
     default:
@@ -47,6 +52,8 @@ export const claudePermissionModeLabel = (mode: ClaudePermissionMode): string =>
   switch (mode) {
     case "acceptEdits":
       return "Accept Edits";
+    case "acceptAll":
+      return "Auto Approve Everything";
     case "plan":
       return "Plan";
     case "default":

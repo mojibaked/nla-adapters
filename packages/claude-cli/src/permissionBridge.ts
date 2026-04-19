@@ -11,7 +11,7 @@ const MCP_TOOL_NAME = "approve";
 const MCP_PERMISSION_TOOL_ID = `mcp__${MCP_SERVER_NAME}__${MCP_TOOL_NAME}`;
 const MCP_PROTOCOL_VERSION = "2024-11-05";
 
-export type ClaudePermissionMode = "default" | "acceptEdits" | "plan";
+export type ClaudePermissionMode = "default" | "acceptEdits" | "acceptAll" | "plan";
 
 export interface ClaudePermissionBridgeOptions {
   readonly requestPermission: (input: {
@@ -194,7 +194,7 @@ export class ClaudePermissionBridge {
     const toolUseId = permissionToolUseId(args);
     const requestId = `claude-permission-${sanitizeId(toolUseId) || ++this.requestCounter}`;
 
-    const autoAccepted = acceptEditsAutoApproval({
+    const autoAccepted = autoApprovePermissionRequest({
       cwd: this.cwd,
       permissionMode: this.permissionMode,
       toolName,
@@ -595,6 +595,19 @@ function preToolUseHookOutput(input: {
       updatedInput: input.updatedInput
     })
   };
+}
+
+function autoApprovePermissionRequest(input: {
+  cwd?: string;
+  permissionMode: ClaudePermissionMode;
+  toolName: string;
+  toolInput: unknown;
+}): { reason: string } | undefined {
+  if (input.permissionMode === "acceptAll") {
+    return { reason: "Claude auto-approve-everything mode." };
+  }
+
+  return acceptEditsAutoApproval(input);
 }
 
 function acceptEditsAutoApproval(input: {

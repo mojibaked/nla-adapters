@@ -173,8 +173,6 @@ export class ClaudeNlaRuntime {
         );
       }
 
-      await this.ensureClient(session);
-
       session.turnState = {
         queue: new AsyncQueue(),
         assistantMessageId,
@@ -183,6 +181,8 @@ export class ClaudeNlaRuntime {
         activeActivities: new Map(),
         assistantMessages: new Map()
       };
+
+      await this.ensureClient(session);
 
       ctx.execution({
         state: "running",
@@ -195,7 +195,11 @@ export class ClaudeNlaRuntime {
         message: {
           role: "user",
           content: prompt
-        }
+        },
+        session_id: session.claudeSessionRef && !isPlaceholderProviderRef(session.claudeSessionRef)
+          ? session.claudeSessionRef
+          : "default",
+        parent_tool_use_id: null
       })}\n`);
 
       await this.driveTurn(session, ctx);
@@ -605,7 +609,6 @@ export class ClaudeNlaRuntime {
     const bridgeStart = await bridge.start();
     const args = [
       ...this.config.commandArgs,
-      "-p",
       "--input-format",
       "stream-json",
       "--output-format",
@@ -669,6 +672,14 @@ export class ClaudeNlaRuntime {
             )
       );
     });
+
+    child.stdin.write(`${JSON.stringify({
+      type: "control_request",
+      request_id: `initialize_${session.sessionId}`,
+      request: {
+        subtype: "initialize"
+      }
+    })}\n`);
 
     return child;
   }
@@ -858,15 +869,13 @@ export class ClaudeNlaRuntime {
     session.child = undefined;
 
     if (session.turnState) {
-      session.turnState.queue.push(error
-        ? {
-            type: "fatal",
-            error
-          }
-        : {
-            type: "turn.completed",
-            status: "completed"
-          });
+      session.turnState.queue.push({
+        type: "fatal",
+        error: error ?? new ClaudeAdapterError(
+          "Claude exited before completing the current turn",
+          "claude_process_exit"
+        )
+      });
     }
   }
 

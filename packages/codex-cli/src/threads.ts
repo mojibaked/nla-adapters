@@ -305,7 +305,8 @@ const isInternalUserMessage = (text: string): boolean => {
     trimmed.startsWith("<apps_instructions>") ||
     trimmed.startsWith("<skills_instructions>") ||
     trimmed.startsWith("<plugins_instructions>") ||
-    trimmed.startsWith("<collaboration_mode>");
+    trimmed.startsWith("<collaboration_mode>") ||
+    trimmed.startsWith("<turn_aborted>");
 };
 
 const sessionIdFromFileName = (fileNameRef: string): string | undefined => {
