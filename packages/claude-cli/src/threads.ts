@@ -7,6 +7,12 @@ import type {
   NlaThreadsHistoryItemData
 } from "@nla/protocol";
 import {
+  claudeContentBlocksFrom,
+  claudeHasNonTextParts,
+  claudeMessagePartsFromContent,
+  claudeTextFromParts
+} from "./content.js";
+import {
   booleanValue,
   previewJson,
   recordValue,
@@ -257,13 +263,15 @@ const historyItemsFromRecord = (
 
   const content = message?.content ?? record.content;
   const items: NlaThreadsHistoryItemData[] = [];
-  const text = textFromContent(content);
-  if (text) {
+  const parts = claudeMessagePartsFromContent(content);
+  const text = claudeTextFromParts(parts) ?? textFromContent(content);
+  if (text || parts?.length) {
     items.push({
       itemId,
       kind: "message",
       role,
-      text,
+      ...(text ? { text } : {}),
+      ...(parts ? { parts } : {}),
       createdAt: timestamp,
       metadata: compactRecord({
         claudeType: type,
@@ -272,7 +280,7 @@ const historyItemsFromRecord = (
     });
   }
 
-  for (const block of contentBlocksFrom(content)) {
+  for (const block of claudeContentBlocksFrom(content)) {
     switch (stringValue(block.type)) {
       case "tool_use": {
         items.push({
@@ -332,20 +340,7 @@ const messageRole = (
 
 const textFromContent = (content: unknown): string | undefined => {
   const direct = stringValue(content);
-  if (direct) {
-    return direct;
-  }
-
-  const parts = contentBlocksFrom(content).flatMap((block) => {
-    if (block.type !== "text") {
-      return [];
-    }
-
-    const text = stringValue(block.text);
-    return text ? [text] : [];
-  });
-
-  return parts.length > 0 ? parts.join("\n\n") : undefined;
+  return direct ?? claudeTextFromParts(claudeMessagePartsFromContent(content));
 };
 
 const textFromToolResult = (content: unknown): string | undefined =>
@@ -367,20 +362,9 @@ const isInternalTaskNotificationRecord = (record: UnknownRecord): boolean => {
 };
 
 const isTaskNotificationContent = (content: unknown): boolean => {
+  const parts = claudeMessagePartsFromContent(content);
   const text = textFromContent(content) ?? stringValue(content);
-  return text?.trim().startsWith("<task-notification") === true;
-};
-
-const contentBlocksFrom = (value: unknown): ReadonlyArray<UnknownRecord> => {
-  if (Array.isArray(value)) {
-    return value.flatMap((item) => {
-      const block = recordValue(item);
-      return block ? [block] : [];
-    });
-  }
-
-  const block = recordValue(value);
-  return block ? [block] : [];
+  return !claudeHasNonTextParts(parts) && text?.trim().startsWith("<task-notification") === true;
 };
 
 const titleForTranscript = (transcript: ClaudeTranscript): string | undefined => {

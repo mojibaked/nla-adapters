@@ -35,6 +35,12 @@
       ],
       "@nla-adapters/wallet-agent/stdio": [
         "packages/wallet-agent/src/stdio.ts"
+      ],
+      "@nla-adapters/autotrader-agent": [
+        "packages/autotrader-agent/src/index.ts"
+      ],
+      "@nla-adapters/autotrader-agent/stdio": [
+        "packages/autotrader-agent/src/stdio.ts"
       ]
     },
     "strict": true,

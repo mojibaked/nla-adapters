@@ -7,6 +7,7 @@ import type {
   NlaSessionInteractionResolveMessage,
   NlaSessionInterruptMessage,
   NlaSessionMessage,
+  NlaSessionMessagePart,
   NlaSessionResumeMessage,
   NlaSessionStartMessage,
   NlaThreadsHistoryRequestMessage,
@@ -23,7 +24,7 @@ import { checkCodexAuth, prepareCodexTurn } from "./inputs.js";
 import { buildCodexResolution, buildInputResponse, buildPendingInputRequest } from "./interactions.js";
 import {
   agentMessageDeltaId,
-  assistantTextFromItem,
+  assistantContentFromItem,
   codexActivityFromItem,
   codexExplorationFromItem,
   codexExplorationTitle,
@@ -37,6 +38,7 @@ import {
   type CodexReasoningSummaryDelta,
   turnErrorMessage
 } from "./notifications.js";
+import { codexTextParts } from "./content.js";
 import {
   mainActivityId,
   metadataString,
@@ -443,7 +445,11 @@ export class CodexNlaRuntime {
           });
           continue;
         case "assistant.final":
-          this.completeAssistantMessage(ctx, turnState, event.messageId, event.text);
+          this.completeAssistantMessage(ctx, turnState, event.messageId, {
+            text: event.text,
+            parts: event.parts,
+            metadata: event.metadata
+          });
           continue;
         case "activity":
           ctx.activity({
@@ -780,13 +786,15 @@ export class CodexNlaRuntime {
           session.turnState.queue.push(activity);
         }
 
-        const assistantText = assistantTextFromItem(item);
-        if (assistantText && message.method === "item/completed") {
+        const assistantContent = assistantContentFromItem(item);
+        if (assistantContent && message.method === "item/completed") {
           this.closeExplorationGroup(session.turnState);
           session.turnState.queue.push({
             type: "assistant.final",
             messageId: itemId(item),
-            text: assistantText
+            text: assistantContent.text,
+            parts: assistantContent.parts,
+            metadata: assistantContent.metadata
           });
         }
         return;
@@ -844,11 +852,17 @@ export class CodexNlaRuntime {
     ctx: NlaSessionHandlerContext,
     turnState: CodexTurnState,
     messageId: string | undefined,
-    text: string
+    message: {
+      readonly text?: string;
+      readonly parts?: ReadonlyArray<NlaSessionMessagePart>;
+      readonly metadata?: Record<string, unknown>;
+    }
   ): void {
     const resolvedMessageId = messageId ?? turnState.assistantMessageId;
     const state = this.assistantMessageState(turnState, resolvedMessageId);
-    state.text = text;
+    state.text = message.text ?? state.text;
+    state.parts = message.parts ? [...message.parts] : state.parts;
+    state.metadata = message.metadata ?? state.metadata;
 
     if (state.completed) {
       return;
@@ -858,7 +872,9 @@ export class CodexNlaRuntime {
     ctx.emit("session.message", {
       sessionId: ctx.session.id,
       role: "assistant",
-      text
+      ...(state.text ? { text: state.text } : {}),
+      ...(state.parts ? { parts: state.parts } : {}),
+      ...(state.metadata ? { metadata: state.metadata } : {})
     }, {
       id: resolvedMessageId
     });
@@ -869,8 +885,12 @@ export class CodexNlaRuntime {
     turnState: CodexTurnState
   ): void {
     for (const [messageId, message] of turnState.assistantMessages) {
-      if (!message.completed && message.text) {
-        this.completeAssistantMessage(ctx, turnState, messageId, message.text);
+      if (!message.completed && (message.text || message.parts?.length)) {
+        this.completeAssistantMessage(ctx, turnState, messageId, {
+          text: message.text || undefined,
+          parts: message.parts ?? codexTextParts(message.text),
+          metadata: message.metadata
+        });
       }
     }
   }

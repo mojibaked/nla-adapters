@@ -1,3 +1,10 @@
+import type { NlaSessionMessagePart } from "@nla/protocol";
+import {
+  claudeContentBlocksFrom,
+  claudeMessagePartsFromContent,
+  claudeTextFromParts,
+  claudeTextParts
+} from "./content.js";
 import { booleanValue, recordValue, stringValue, type UnknownRecord } from "./shared.js";
 import type { ClaudeTurnEvent } from "./types.js";
 
@@ -50,34 +57,35 @@ const parseClaudeOutput = (event: UnknownRecord): ParsedClaudeOutput => {
     }
   }
 
-  const streamContentBlocks = contentBlocksFrom(streamEvent?.content_block);
+  const streamContentBlocks = claudeContentBlocksFrom(streamEvent?.content_block);
   const contentBlocks = streamEvent
     ? streamContentBlocks
-    : contentBlocksFrom(message?.content);
-  const textChunks: string[] = [];
-  const flushText = (): void => {
-    if (textChunks.length === 0) {
+    : claudeContentBlocksFrom(message?.content);
+  const renderableParts: NlaSessionMessagePart[] = [];
+  const flushRenderableParts = (): void => {
+    if (renderableParts.length === 0) {
       return;
     }
 
     events.push({
       type: "assistant.final",
-      text: textChunks.join(""),
+      text: claudeTextFromParts(renderableParts),
+      parts: [...renderableParts],
       providerMessageId
     });
-    textChunks.length = 0;
+    renderableParts.length = 0;
   };
 
   for (const contentBlock of contentBlocks) {
-    if (isAssistantOutput && contentBlock.type === "text") {
-      const text = stringValue(contentBlock.text);
-      if (text) {
-        textChunks.push(text);
+    if (isAssistantOutput) {
+      const parts = claudeMessagePartsFromContent([contentBlock]);
+      if (parts?.length) {
+        renderableParts.push(...parts);
+        continue;
       }
-      continue;
     }
 
-    flushText();
+    flushRenderableParts();
 
     if (contentBlock.type === "tool_use") {
       const name = stringValue(contentBlock.name) || "tool";
@@ -107,13 +115,14 @@ const parseClaudeOutput = (event: UnknownRecord): ParsedClaudeOutput => {
       }
     }
   }
-  flushText();
+  flushRenderableParts();
 
   const result = stringValue(event.result);
   if (result) {
     events.push({
       type: "assistant.final",
       text: result,
+      parts: claudeTextParts(result),
       providerMessageId,
       aggregate: true
     });
@@ -139,18 +148,6 @@ const parseClaudeOutput = (event: UnknownRecord): ParsedClaudeOutput => {
     providerMessageId,
     events
   };
-};
-
-const contentBlocksFrom = (value: unknown): ReadonlyArray<UnknownRecord> => {
-  if (Array.isArray(value)) {
-    return value.flatMap((item) => {
-      const block = recordValue(item);
-      return block ? [block] : [];
-    });
-  }
-
-  const block = recordValue(value);
-  return block ? [block] : [];
 };
 
 const isToolResultError = (contentBlock: UnknownRecord): boolean =>

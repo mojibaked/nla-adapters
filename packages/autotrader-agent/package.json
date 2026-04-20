@@ -1,0 +1,32 @@
+{
+  "name": "@nla-adapters/autotrader-agent",
+  "version": "0.1.0",
+  "description": "Autotrader browsing adapter backed by browser-mcp.",
+  "type": "module",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    },
+    "./stdio": {
+      "types": "./dist/stdio.d.ts",
+      "import": "./dist/stdio.js"
+    }
+  },
+  "files": [
+    "dist"
+  ],
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "test": "npm run build --silent && node --test tests/*.test.mjs"
+  },
+  "dependencies": {
+    "@nla-adapters/contracts": "file:../contracts",
+    "@nla/protocol": "file:../../../nla/packages/protocol",
+    "@nla/sdk-core": "file:../../../nla/packages/sdk-core",
+    "@nla/transport-stdio-jsonl": "file:../../../nla/packages/transport-stdio-jsonl",
+    "browser-mcp": "file:../../../browser-mcp"
+  }
+}

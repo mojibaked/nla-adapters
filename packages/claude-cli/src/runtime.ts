@@ -11,6 +11,7 @@ import type {
   NlaSessionInteractionResolveMessage,
   NlaSessionInterruptMessage,
   NlaSessionMessage,
+  NlaSessionMessagePart,
   NlaSessionResumeMessage,
   NlaSessionStartMessage,
   NlaThreadsHistoryRequestMessage,
@@ -32,6 +33,7 @@ import {
 } from "./inputs.js";
 import { parseClaudeOutputLine } from "./notifications.js";
 import { ClaudePermissionBridge, type ClaudePermissionResult } from "./permissionBridge.js";
+import { claudeTextParts } from "./content.js";
 import { recordValue, stringValue, type UnknownRecord } from "./shared.js";
 import { getClaudeThreadHistory, listClaudeThreads } from "./threads.js";
 import {
@@ -425,7 +427,11 @@ export class ClaudeNlaRuntime {
           if (event.aggregate && turnState.assistantMessages.size > 0) {
             continue;
           }
-          this.completeAssistantMessage(ctx, turnState, event.providerMessageId, event.text);
+          this.completeAssistantMessage(ctx, turnState, event.providerMessageId, {
+            text: event.text,
+            parts: event.parts,
+            metadata: event.metadata
+          });
           continue;
         case "activity":
           if (event.status !== "running" && !turnState.activeActivities.has(event.activityId)) {
@@ -524,11 +530,17 @@ export class ClaudeNlaRuntime {
     ctx: NlaSessionHandlerContext,
     turnState: ClaudeTurnState,
     providerMessageId: string | undefined,
-    text: string
+    message: {
+      readonly text?: string;
+      readonly parts?: ReadonlyArray<NlaSessionMessagePart>;
+      readonly metadata?: Record<string, unknown>;
+    }
   ): void {
     const messageId = this.assistantMessageId(turnState, providerMessageId);
     const state = this.assistantMessageState(turnState, messageId);
-    state.text = text;
+    state.text = message.text ?? state.text;
+    state.parts = message.parts ? [...message.parts] : state.parts;
+    state.metadata = message.metadata ?? state.metadata;
 
     if (state.completed) {
       return;
@@ -538,7 +550,9 @@ export class ClaudeNlaRuntime {
     ctx.emit("session.message", {
       sessionId: ctx.session.id,
       role: "assistant",
-      text
+      ...(state.text ? { text: state.text } : {}),
+      ...(state.parts ? { parts: state.parts } : {}),
+      ...(state.metadata ? { metadata: state.metadata } : {})
     }, {
       id: messageId
     });
@@ -549,8 +563,12 @@ export class ClaudeNlaRuntime {
     turnState: ClaudeTurnState
   ): void {
     for (const [messageId, message] of turnState.assistantMessages) {
-      if (!message.completed && message.text) {
-        this.completeAssistantMessage(ctx, turnState, messageId, message.text);
+      if (!message.completed && (message.text || message.parts?.length)) {
+        this.completeAssistantMessage(ctx, turnState, messageId, {
+          text: message.text || undefined,
+          parts: message.parts ?? claudeTextParts(message.text),
+          metadata: message.metadata
+        });
       }
     }
   }

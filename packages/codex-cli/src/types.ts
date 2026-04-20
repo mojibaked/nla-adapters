@@ -1,5 +1,8 @@
 import type { AssetCapabilityClient } from "@nla-adapters/contracts";
-import type { NlaInteractionPayload } from "@nla/protocol";
+import type {
+  NlaInteractionPayload,
+  NlaSessionMessagePart
+} from "@nla/protocol";
 import type {
   CodexAppServerClient,
   CodexAppServerNotificationMessage,
@@ -87,6 +90,8 @@ export interface CodexReasoningSummaryState {
 
 export interface CodexAssistantMessageState {
   text: string;
+  parts?: NlaSessionMessagePart[];
+  metadata?: Record<string, unknown>;
   completed: boolean;
 }
 
@@ -127,7 +132,9 @@ export type CodexTurnEvent =
   | {
       readonly type: "assistant.final";
       readonly messageId?: string;
-      readonly text: string;
+      readonly text?: string;
+      readonly parts?: NlaSessionMessagePart[];
+      readonly metadata?: Record<string, unknown>;
     }
   | {
       readonly type: "activity";

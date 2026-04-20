@@ -6,6 +6,11 @@ import type {
   NlaThreadSummaryData,
   NlaThreadsHistoryItemData
 } from "@nla/protocol";
+import {
+  codexHasNonTextParts,
+  codexMessagePartsFromValue,
+  codexTextFromParts
+} from "./content.js";
 import { recordValue, stringValue } from "./shared.js";
 
 const DefaultLimit = 50;
@@ -242,8 +247,14 @@ const historyItemFromResponseItem = (
     return undefined;
   }
 
-  const text = textFromContent(item.content);
-  if (!text || (role === "user" && isInternalUserMessage(text))) {
+  const parts = codexMessagePartsFromValue(item.content);
+  const text = codexTextFromParts(parts) ?? textFromContent(item.content);
+  if ((!text && !parts?.length) || (
+    role === "user"
+    && text
+    && !codexHasNonTextParts(parts)
+    && isInternalUserMessage(text)
+  )) {
     return undefined;
   }
 
@@ -251,7 +262,8 @@ const historyItemFromResponseItem = (
     itemId: stringValue(item.id) ?? `codex-history-${index}`,
     kind: "message",
     role,
-    text,
+    ...(text ? { text } : {}),
+    ...(parts ? { parts } : {}),
     createdAt: timestamp,
     metadata: compactRecord({
       codexType: item.type,

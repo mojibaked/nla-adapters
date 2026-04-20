@@ -1,5 +1,8 @@
 import type { AssetCapabilityClient } from "@nla-adapters/contracts";
-import type { NlaInteractionPayload } from "@nla/protocol";
+import type {
+  NlaInteractionPayload,
+  NlaSessionMessagePart
+} from "@nla/protocol";
 import type { ClaudeAdapterConfig } from "./config.js";
 import type {
   ClaudePermissionBridge,
@@ -50,6 +53,8 @@ export interface ClaudeTurnState {
 
 export interface ClaudeAssistantMessageState {
   text: string;
+  parts?: NlaSessionMessagePart[];
+  metadata?: Record<string, unknown>;
   completed: boolean;
 }
 
@@ -88,7 +93,9 @@ export type ClaudeTurnEvent =
     }
   | {
       readonly type: "assistant.final";
-      readonly text: string;
+      readonly text?: string;
+      readonly parts?: NlaSessionMessagePart[];
+      readonly metadata?: Record<string, unknown>;
       readonly providerMessageId?: string;
       readonly aggregate?: boolean;
     }

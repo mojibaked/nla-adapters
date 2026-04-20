@@ -1,3 +1,9 @@
+import type { NlaSessionMessagePart } from "@nla/protocol";
+import {
+  codexMessagePartsFromValue,
+  codexTextFromParts,
+  codexTextParts
+} from "./content.js";
 import { recordValue, stringValue } from "./shared.js";
 
 export type CodexActivityStatus = "running" | "succeeded" | "failed";
@@ -146,10 +152,32 @@ export const codexReasoningTitle = (
   return compact ? `${prefix}: ${compact}` : prefix;
 };
 
-export const assistantTextFromItem = (item: Record<string, unknown>): string | undefined =>
-  stringValue(item.type) === "agentMessage"
-    ? stringValue(item.text)
+export const assistantContentFromItem = (
+  item: Record<string, unknown>
+): {
+  readonly text?: string;
+  readonly parts?: NlaSessionMessagePart[];
+  readonly metadata?: Record<string, unknown>;
+} | undefined => {
+  if (stringValue(item.type) !== "agentMessage") {
+    return undefined;
+  }
+
+  const parts = codexMessagePartsFromValue(item.content ?? item.parts)
+    ?? codexTextParts(stringValue(item.text));
+  const text = stringValue(item.text) ?? codexTextFromParts(parts);
+  const metadata = compactRecord({
+    phase: stringValue(item.phase)
+  });
+
+  return text || parts?.length || metadata
+    ? {
+        ...(text ? { text } : {}),
+        ...(parts ? { parts } : {}),
+        ...(metadata ? { metadata } : {})
+      }
     : undefined;
+};
 
 export const itemId = (item: Record<string, unknown> | undefined): string | undefined =>
   stringValue(item?.id) ?? stringValue(item?.itemId) ?? stringValue(item?.item_id);
@@ -284,6 +312,13 @@ const explorationDetails = (
 const compactLabel = (value: string): string => {
   const compact = value.replace(/\s+/g, " ").trim();
   return compact.length > 64 ? `${compact.slice(0, 61)}...` : compact;
+};
+
+const compactRecord = (
+  value: Record<string, unknown>
+): Record<string, unknown> | undefined => {
+  const entries = Object.entries(value).filter(([, entry]) => entry !== undefined);
+  return entries.length > 0 ? Object.fromEntries(entries) : undefined;
 };
 
 const fileName = (value: string | undefined): string | undefined => {
