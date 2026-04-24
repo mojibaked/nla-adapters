@@ -14,6 +14,12 @@
       "path": "./packages/todo-agent"
     },
     {
+      "path": "./packages/research-agent"
+    },
+    {
+      "path": "./packages/research-agent-browser"
+    },
+    {
       "path": "./packages/wallet-agent"
     },
     {

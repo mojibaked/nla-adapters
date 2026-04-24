@@ -3,6 +3,7 @@ import {
   type BrowserMcp,
   type BrowserMcpGetHtmlAllResult,
   type BrowserMcpLaunchOptions,
+  type BrowserMcpListMediaUrlsResult,
   type BrowserMcpSnapshot,
 } from "browser-mcp";
 import {
@@ -19,14 +20,28 @@ export interface AutotraderBrowserDependencies {
   readonly browserOptions?: BrowserMcpLaunchOptions;
 }
 
+export interface AutotraderBrowserLoader {
+  readonly getBrowser: () => Promise<BrowserMcp>;
+  readonly closeBrowser: () => Promise<void>;
+}
+
 type BrowserActionResult =
   | { readonly ok: true }
   | { readonly ok: false; readonly status: "rejected"; readonly message: string };
 type BrowserSnapshotResult = BrowserMcpSnapshot | AutotraderApprovalRejectedResult;
 type BrowserGetTextResult = string | AutotraderApprovalRejectedResult;
+type BrowserGetHtmlMissResult = {
+  readonly found: false;
+  readonly html: null;
+  readonly reason: string;
+};
 type BrowserGetHtmlResult =
   | string
   | BrowserMcpGetHtmlAllResult
+  | BrowserGetHtmlMissResult
+  | AutotraderApprovalRejectedResult;
+type BrowserListMediaUrlsToolResult =
+  | BrowserMcpListMediaUrlsResult
   | AutotraderApprovalRejectedResult;
 type BrowserSelectOptionResult =
   | { readonly ok: true; readonly value: string }
@@ -38,16 +53,37 @@ type BrowserWaitForResult = { ok: true } | AutotraderApprovalRejectedResult;
 
 export const createBrowserLoader = (
   dependencies: AutotraderBrowserDependencies
-): (() => Promise<BrowserMcp>) => {
+): AutotraderBrowserLoader => {
   let browserPromise: Promise<BrowserMcp> | undefined;
 
-  return async () => {
-    if (!browserPromise) {
-      browserPromise = dependencies.browser
-        ? Promise.resolve(dependencies.browser)
-        : launchBrowserMcp(dependencies.browserOptions);
-    }
-    return await browserPromise;
+  return {
+    getBrowser: async () => {
+      if (!browserPromise) {
+        browserPromise = (
+          dependencies.browser
+            ? Promise.resolve(dependencies.browser)
+            : launchBrowserMcp(dependencies.browserOptions)
+        ).catch((error) => {
+          browserPromise = undefined;
+          throw error;
+        });
+      }
+      return await browserPromise;
+    },
+    closeBrowser: async () => {
+      const activeBrowser = browserPromise;
+      browserPromise = undefined;
+      if (!activeBrowser) {
+        return;
+      }
+
+      const browser = await activeBrowser.catch(() => undefined);
+      if (!browser) {
+        return;
+      }
+
+      await browser.close();
+    },
   };
 };
 
@@ -133,7 +169,7 @@ export const createAutotraderBrowserTools = (
   tool<{}, unknown, BrowserGetHtmlResult>({
     name: "get_html",
     description:
-      "Return outerHTML for a CSS selector. With `all: true`, returns all matches up to `limit`; otherwise returns the first match as a raw HTML string. When approval mode is enabled, this may instead return `{ status: \"rejected\", message }`.",
+      "Return outerHTML for a CSS selector. With `all: true`, returns all matches up to `limit`; otherwise returns the first match as a raw HTML string. If nothing matches, this returns `{ found: false, html: null, reason }` instead of failing the turn. When approval mode is enabled, this may instead return `{ status: \"rejected\", message }`.",
     inputSchema: {
       type: "object",
       additionalProperties: false,
@@ -167,10 +203,55 @@ export const createAutotraderBrowserTools = (
       }
 
       const browser = await getBrowser();
-      return await browser.getHtml(
+      try {
+        return await browser.getHtml(
+          {
+            selector,
+            all,
+            limit,
+          },
+          {
+            signal: context.signal,
+          }
+        );
+      } catch (error) {
+        if (!all && isElementNotFoundError(error)) {
+          return {
+            found: false,
+            html: null,
+            reason: errorMessage(error),
+          };
+        }
+        throw error;
+      }
+    },
+  }),
+  tool<{}, unknown, BrowserListMediaUrlsToolResult>({
+    name: "list_media_urls",
+    description:
+      "Return de-duplicated absolute image/media URLs from the active page by scanning image tags, srcset attributes, social-image meta tags, and JSON-LD image fields. Prefer this over guessing CDN-specific selectors when the user asks for photos or image URLs. When approval mode is enabled, this may instead return `{ status: \"rejected\", message }`.",
+    inputSchema: {
+      type: "object",
+      additionalProperties: false,
+      properties: {
+        limit: {
+          type: "number",
+          description: "Maximum number of media URLs to return.",
+        },
+      },
+    },
+    execute: async (context, input) => {
+      const limit = requireOptionalNumber(input, "limit");
+      const approval = await requestAutotraderToolApproval(context, "list_media_urls", {
+        ...(typeof limit === "number" ? { limit } : {}),
+      });
+      if (approval.status === "rejected") {
+        return approval;
+      }
+
+      const browser = await getBrowser();
+      return await browser.listMediaUrls(
         {
-          selector,
-          all,
           limit,
         },
         {
@@ -487,3 +568,9 @@ const requireOptionalNumber = (input: unknown, key: string): number | undefined 
 
 const summarizeValue = (value: string): string =>
   value.length <= 120 ? value : `${value.slice(0, 117)}...`;
+
+const isElementNotFoundError = (error: unknown): boolean =>
+  errorMessage(error).toLowerCase().includes("element not found");
+
+const errorMessage = (error: unknown): string =>
+  error instanceof Error ? error.message : String(error);

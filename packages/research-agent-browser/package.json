@@ -1,0 +1,38 @@
+{
+  "name": "@nla-adapters/research-agent-browser",
+  "version": "0.1.0",
+  "description": "Model-agnostic research client for @nla-adapters/research-agent. Drives a browser tool through a search -> parallel extract -> synthesize pipeline.",
+  "type": "module",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    },
+    "./exa": {
+      "types": "./dist/exa.d.ts",
+      "import": "./dist/exa.js"
+    },
+    "./mcp": {
+      "types": "./dist/mcp.d.ts",
+      "import": "./dist/mcp.js"
+    },
+    "./stdio": {
+      "types": "./dist/stdio.d.ts",
+      "import": "./dist/stdio.js"
+    }
+  },
+  "files": [
+    "dist"
+  ],
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "test": "npm run build --silent && node --test tests/*.test.mjs"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.0.4",
+    "@nla-adapters/research-agent": "*",
+    "@nla/transport-stdio-jsonl": "file:../../../nla/packages/transport-stdio-jsonl"
+  }
+}

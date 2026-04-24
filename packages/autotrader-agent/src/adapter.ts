@@ -3,6 +3,7 @@ import {
   tool,
   type NlaAdapterDefinition,
   type NlaSessionReplyData,
+  type NlaSessionToolDefinition,
   type NlaToolLoopModel,
   type NlaToolLoopRequest,
   type NlaToolLoopRequestOptions,
@@ -10,6 +11,12 @@ import {
   type NlaToolLoopStreamEvent,
   type NlaToolLoopSessionMemoryStore
 } from "@nla/sdk-core";
+import {
+  adapterTool,
+  finalAssistantText,
+  type NlaAdapterTarget,
+  type NlaSessionLauncher
+} from "@nla/delegation";
 import type { StorageClient } from "@nla-adapters/contracts";
 import {
   findStaleListings,
@@ -40,13 +47,27 @@ export interface AutotraderAgentDependencies extends AutotraderBrowserDependenci
   readonly storage: Pick<StorageClient, "getJson" | "putJson">;
   readonly storageKey?: string;
   readonly conversationMemory?: NlaToolLoopSessionMemoryStore<{}>;
+  readonly researchLauncher?: NlaSessionLauncher;
   readonly now?: () => Date;
 }
+
+interface ResearchVehicleMarketInput {
+  readonly query: string;
+  readonly vehicleContext?: string;
+  readonly listingContext?: string;
+}
+
+const ResearchAgentTarget = {
+  id: "research.agent",
+  metadata: {
+    installId: "research.agent.process"
+  }
+} satisfies NlaAdapterTarget;
 
 const INSTRUCTIONS = [
   "You are the Autotrader shopping agent. You help the user find and track car listings on autotrader.com.",
   "",
-  "Built-in browser tools (navigate, snapshot, get_text, get_html, click, fill, select_option, press_key, scroll, wait_for) are available to drive the site. Use them to search autotrader and pull listing data.",
+  "Built-in browser tools (navigate, snapshot, get_text, get_html, list_media_urls, click, fill, select_option, press_key, scroll, wait_for) are available to drive the site. Use them to search autotrader and pull listing data.",
   "Snapshot returns refs like `r12`; use them as selectors in the form `[data-mcp-ref=\"r12\"]` for click/fill/select_option/press_key/scroll.",
   "When approval mode is enabled by the host, any tool may return `{ status: \"rejected\", message: ... }` if the user denies it. If that happens, explain what was blocked and stop or ask whether to retry.",
   "",
@@ -60,8 +81,18 @@ const INSTRUCTIONS = [
   "Every SRP embeds a <script data-cmp=\"listingsCollectionSchema\" type=\"application/ld+json\"> containing every visible listing with full structured data.",
   "After navigating, call get_html with selector `script[data-cmp=\"listingsCollectionSchema\"]` and pass the result to the `save_listings` tool. Never ask the user for prices — read them from the JSON-LD.",
   "",
+  "PDP MEDIA — use the deterministic media tool first:",
+  "When the user asks for photos or image URLs from a vehicle detail page, call `list_media_urls` first. It scans `img/src`, `srcset`, social-image meta tags, and JSON-LD image fields, and returns absolute URLs.",
+  "Never assume a CDN hostname such as `dealer.com`. If a narrow selector misses, broaden the read instead of ending the turn.",
+  "",
+  "READ HYGIENE:",
+  "Use `get_html` for structured islands you already expect to exist, such as Autotrader's JSON-LD scripts. For exploratory reads, prefer `snapshot`, `list_media_urls`, or `get_html` with `all: true`.",
+  "If `get_html` returns `{ found: false, ... }`, treat that as a selector miss and try a broader query.",
+  "",
   "SESSION OPENING — check what we already know:",
   "Before a fresh search, call `list_stored_listings` and `find_stale_listings` to see what the user already has. If they ask about something you already have cached, summarize from cache first, then offer to refresh stale entries.",
+  "",
+  "MARKET RESEARCH — use `research_vehicle_market` when available for broader market context, common issues, price comps, model-year reliability, dealer/listing background, or questions that require sources beyond the current Autotrader page.",
   "",
   "REFRESHING — re-check a specific listing:",
   "To verify a stored listing is still available/priced correctly, navigate its pdpUrl, then pull and save the page's JSON-LD. `save_listings` upserts by VIN and updates lastSeenAt; stale data refreshes automatically.",
@@ -83,7 +114,7 @@ interface AutotraderTurnContext {
 export const createAutotraderAgent = (
   dependencies: AutotraderAgentDependencies
 ): NlaAdapterDefinition => {
-  const getBrowser = createBrowserLoader(dependencies);
+  const { getBrowser, closeBrowser } = createBrowserLoader(dependencies);
   const ctx: ActionContext = {
     storage: dependencies.storage,
     storageKey: dependencies.storageKey?.trim() || DefaultListingsStorageKey,
@@ -100,12 +131,16 @@ export const createAutotraderAgent = (
         previewListings: []
       }
     }),
+    onSessionStop: async () => {
+      await closeBrowser().catch(() => undefined);
+    },
     model: (context) =>
       createAutotraderPresentationModel(dependencies.createModel(), context.presentation),
     maxIterations: 20,
     memory: dependencies.conversationMemory,
     tools: [
       ...createAutotraderBrowserTools(getBrowser),
+      ...createResearchTools(dependencies.researchLauncher),
       tool<AutotraderTurnContext, unknown, SaveListingsResult | AutotraderApprovalRejectedResult>({
         name: "save_listings",
         description:
@@ -229,6 +264,76 @@ export const createAutotraderAgent = (
       })
     ]
   });
+};
+
+const createResearchTools = (
+  launcher: NlaSessionLauncher | undefined
+): ReadonlyArray<NlaSessionToolDefinition<AutotraderTurnContext, any, any>> =>
+  launcher
+    ? [
+        adapterTool<AutotraderTurnContext, ResearchVehicleMarketInput, string>({
+          name: "research_vehicle_market",
+          description:
+            "Delegate a focused vehicle-market research question to the research agent. Use this for market context, common issues, price comps, model-year reliability, dealer/listing background, or source-backed facts beyond the current Autotrader page.",
+          inputSchema: {
+            type: "object",
+            additionalProperties: false,
+            required: ["query"],
+            properties: {
+              query: {
+                type: "string",
+                description: "Focused research question to answer."
+              },
+              vehicleContext: {
+                type: "string",
+                description: "Optional make/model/year/trim or other vehicle context from the user's request or listing."
+              },
+              listingContext: {
+                type: "string",
+                description: "Optional listing/dealer/price/location context to ground the research request."
+              }
+            }
+          },
+          decode: decodeResearchVehicleMarketInput,
+          target: ResearchAgentTarget,
+          launcher,
+          mapInput: ({ input }) => ({
+            text: formatResearchVehicleMarketPrompt(input),
+            metadata: {
+              kind: "autotrader.research_vehicle_market",
+              query: input.query
+            }
+          }),
+          mapOutput: finalAssistantText
+        })
+      ]
+    : [];
+
+const decodeResearchVehicleMarketInput = (
+  input: unknown
+): ResearchVehicleMarketInput => ({
+  query: requireString(input, "query", "research_vehicle_market requires `query`"),
+  ...optionalStringProperty(input, "vehicleContext"),
+  ...optionalStringProperty(input, "listingContext")
+});
+
+const formatResearchVehicleMarketPrompt = (
+  input: ResearchVehicleMarketInput
+): string => {
+  const sections = [
+    "Research this Autotrader vehicle-shopping question. Keep the answer concise and include source titles or URLs.",
+    `Question: ${input.query}`
+  ];
+
+  if (input.vehicleContext) {
+    sections.push(`Vehicle context:\n${input.vehicleContext}`);
+  }
+
+  if (input.listingContext) {
+    sections.push(`Listing context:\n${input.listingContext}`);
+  }
+
+  return sections.join("\n\n");
 };
 
 const createAutotraderPresentationModel = (
@@ -529,6 +634,16 @@ const requireNumber = (input: unknown, key: string, message: string): number => 
 
 const isRecord = (value: unknown): value is Record<string, unknown> =>
   !!value && typeof value === "object" && !Array.isArray(value);
+
+const optionalStringProperty = (
+  input: unknown,
+  key: "vehicleContext" | "listingContext"
+): Partial<Pick<ResearchVehicleMarketInput, "vehicleContext" | "listingContext">> => {
+  const value = isRecord(input) ? input[key] : undefined;
+  return typeof value === "string" && value.trim()
+    ? { [key]: value.trim() }
+    : {};
+};
 
 const describeUnknownValue = (value: unknown): string => {
   if (value === null) return "null";

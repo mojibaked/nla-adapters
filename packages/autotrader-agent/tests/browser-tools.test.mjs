@@ -106,6 +106,173 @@ test("autotrader agent exposes built-in browser tools directly", async () => {
   );
 });
 
+test("autotrader agent exposes the media URL browser tool directly", async () => {
+  const mediaUrlCalls = [];
+  let issuedListMediaUrls = false;
+
+  const runtime = createAdapterRuntime(createAutotraderAgent({
+    createModel: () => ({
+      async respond() {
+        if (!issuedListMediaUrls) {
+          issuedListMediaUrls = true;
+          return {
+            type: "tool_calls",
+            calls: [
+              {
+                callId: "call:list-media-urls",
+                toolName: "list_media_urls",
+                input: {
+                  limit: 5
+                }
+              }
+            ]
+          };
+        }
+
+        return {
+          type: "assistant",
+          text: "done"
+        };
+      }
+    }),
+    browser: {
+      async listMediaUrls(input) {
+        mediaUrlCalls.push(input);
+        return {
+          urls: [
+            "https://images.autotrader.com/photo-1.jpg",
+            "https://images.autotrader.com/photo-2.jpg"
+          ],
+          total: 2,
+          truncated: false
+        };
+      }
+    },
+    storage: createFakeStorage()
+  }));
+
+  await runtime.handle(createEnvelope("session.start", {
+    sessionId: "sess_autotrader_media_urls"
+  }, {
+    correlationId: "start:sess_autotrader_media_urls"
+  }));
+
+  const turnMessages = [];
+  await runtime.handleStream(createEnvelope("session.message", {
+    sessionId: "sess_autotrader_media_urls",
+    role: "user",
+    text: "share some image urls",
+    metadata: {
+      turnId: "turn_autotrader_media_urls"
+    }
+  }, {
+    correlationId: "turn:sess_autotrader_media_urls"
+  }), (message) => {
+    turnMessages.push(message);
+  });
+
+  assert.deepEqual(mediaUrlCalls, [
+    {
+      limit: 5
+    }
+  ]);
+  assert.equal(
+    turnMessages.some((message) =>
+      message.type === "session.message"
+      && message.data.role === "assistant"
+      && message.data.text === "done"
+    ),
+    true
+  );
+  assert.equal(
+    turnMessages.some((message) => message.type === "session.completed"),
+    true
+  );
+});
+
+test("autotrader agent treats missing get_html selectors as recoverable misses", async () => {
+  const getHtmlCalls = [];
+  let issuedGetHtml = false;
+
+  const runtime = createAdapterRuntime(createAutotraderAgent({
+    createModel: () => ({
+      async respond(request) {
+        const getHtmlResult = request.messages.find((message) =>
+          message.role === "tool" && message.toolName === "get_html"
+        );
+        if (!issuedGetHtml) {
+          issuedGetHtml = true;
+          return {
+            type: "tool_calls",
+            calls: [
+              {
+                callId: "call:get-html-miss",
+                toolName: "get_html",
+                input: {
+                  selector: "img[src*=\"dealer.com\"]"
+                }
+              }
+            ]
+          };
+        }
+
+        assert.ok(getHtmlResult);
+        return {
+          type: "assistant",
+          text: "done"
+        };
+      }
+    }),
+    browser: {
+      async getHtml(input) {
+        getHtmlCalls.push(input);
+        throw new Error("element not found");
+      }
+    },
+    storage: createFakeStorage()
+  }));
+
+  await runtime.handle(createEnvelope("session.start", {
+    sessionId: "sess_autotrader_get_html_miss"
+  }, {
+    correlationId: "start:sess_autotrader_get_html_miss"
+  }));
+
+  const turnMessages = [];
+  await runtime.handleStream(createEnvelope("session.message", {
+    sessionId: "sess_autotrader_get_html_miss",
+    role: "user",
+    text: "look for photos",
+    metadata: {
+      turnId: "turn_autotrader_get_html_miss"
+    }
+  }, {
+    correlationId: "turn:sess_autotrader_get_html_miss"
+  }), (message) => {
+    turnMessages.push(message);
+  });
+
+  assert.deepEqual(getHtmlCalls, [
+    {
+      selector: "img[src*=\"dealer.com\"]",
+      all: undefined,
+      limit: undefined
+    }
+  ]);
+  assert.equal(
+    turnMessages.some((message) =>
+      message.type === "session.message"
+      && message.data.role === "assistant"
+      && message.data.text === "done"
+    ),
+    true
+  );
+  assert.equal(
+    turnMessages.some((message) => message.type === "session.failed"),
+    false
+  );
+});
+
 test("autotrader agent interrupts an in-flight browser navigation", async () => {
   let observedSignal;
 

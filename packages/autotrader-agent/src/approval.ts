@@ -7,6 +7,7 @@ export type AutotraderToolName =
   | "snapshot"
   | "get_text"
   | "get_html"
+  | "list_media_urls"
   | "click"
   | "fill"
   | "select_option"

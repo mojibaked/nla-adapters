@@ -30,6 +30,24 @@
       "@nla-adapters/todo-agent/stdio": [
         "packages/todo-agent/src/stdio.ts"
       ],
+      "@nla-adapters/research-agent": [
+        "packages/research-agent/src/index.ts"
+      ],
+      "@nla-adapters/research-agent/stdio": [
+        "packages/research-agent/src/stdio.ts"
+      ],
+      "@nla-adapters/research-agent-browser": [
+        "packages/research-agent-browser/src/index.ts"
+      ],
+      "@nla-adapters/research-agent-browser/exa": [
+        "packages/research-agent-browser/src/exa.ts"
+      ],
+      "@nla-adapters/research-agent-browser/mcp": [
+        "packages/research-agent-browser/src/mcp.ts"
+      ],
+      "@nla-adapters/research-agent-browser/stdio": [
+        "packages/research-agent-browser/src/stdio.ts"
+      ],
       "@nla-adapters/wallet-agent": [
         "packages/wallet-agent/src/index.ts"
       ],

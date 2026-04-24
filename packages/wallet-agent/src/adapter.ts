@@ -257,59 +257,15 @@ type WalletAgentToolOutput =
   | WalletContactsResultOutput
   | WalletAccountsResultOutput;
 
+type WalletAgentStorageClient = Pick<EffectStorageClient, "getJson" | "putJson">;
+
 export interface WalletAgentDependencies {
   readonly createModel: () => NlaToolLoopModel;
-  readonly storage: Pick<EffectStorageClient, "getJson" | "putJson">;
+  readonly storage: WalletAgentStorageClient;
   readonly signing: SigningCapabilityClient;
   readonly wallet: WalletCapabilityClient;
   readonly conversationMemory?: NlaToolLoopSessionMemoryStore<{}>;
 }
-
-let currentDependencies: WalletAgentDependencies | undefined;
-
-const setCurrentDependencies = (
-  dependencies: WalletAgentDependencies
-): void => {
-  currentDependencies = dependencies;
-};
-
-const requireDependencies = (): WalletAgentDependencies => {
-  if (!currentDependencies) {
-    throw new Error("Wallet agent dependencies have not been configured");
-  }
-
-  return currentDependencies;
-};
-
-const requestSignature = (
-  request: SigningRequest
-): ReturnType<SigningCapabilityClient["requestSignature"]> =>
-  requireDependencies().signing.requestSignature(request);
-
-const listAccounts = (
-  request?: Parameters<WalletCapabilityClient["listAccounts"]>[0]
-): ReturnType<WalletCapabilityClient["listAccounts"]> =>
-  requireDependencies().wallet.listAccounts(request);
-
-const resolveAccount = (
-  request: Parameters<WalletCapabilityClient["resolveAccount"]>[0]
-): ReturnType<WalletCapabilityClient["resolveAccount"]> =>
-  requireDependencies().wallet.resolveAccount(request);
-
-const ensureAccount = (
-  request: Parameters<WalletCapabilityClient["ensureAccount"]>[0]
-): ReturnType<WalletCapabilityClient["ensureAccount"]> =>
-  requireDependencies().wallet.ensureAccount(request);
-
-const getJson = (
-  request: Parameters<EffectStorageClient["getJson"]>[0]
-): ReturnType<EffectStorageClient["getJson"]> =>
-  requireDependencies().storage.getJson(request);
-
-const putJson = (
-  request: Parameters<EffectStorageClient["putJson"]>[0]
-): ReturnType<EffectStorageClient["putJson"]> =>
-  requireDependencies().storage.putJson(request);
 
 interface PendingTransferRequest {
   readonly transactionId: string;
@@ -710,8 +666,6 @@ type WalletAgentNlaToolContext = NlaSessionToolContextBase;
 export const createWalletAgent = (
   dependencies: WalletAgentDependencies
 ) => {
-  setCurrentDependencies(dependencies);
-
   return defineToolLoopSessionAdapter<{}>({
     id: "wallet.agent",
     name: "Wallet Agent",
@@ -746,7 +700,7 @@ export const createWalletAgent = (
         decode: decodeTransferToolInput,
         execute: async (context, input) =>
           Effect.runPromise(
-            executeTransferSignatureTool(toWalletAgentExecutionContext(context), input)
+            executeTransferSignatureTool(toWalletAgentExecutionContext(context, dependencies), input)
           )
       }),
       nlaTool<{}, ManageContactsInput, WalletContactsResultOutput>({
@@ -756,7 +710,7 @@ export const createWalletAgent = (
         decode: decodeManageContactsToolInput,
         execute: async (context, input) =>
           Effect.runPromise(
-            executeManageContactsTool(toWalletAgentExecutionContext(context), input)
+            executeManageContactsTool(toWalletAgentExecutionContext(context, dependencies), input)
           )
       }),
       nlaTool<{}, GetContactsQuery, WalletContactsResultOutput>({
@@ -766,7 +720,7 @@ export const createWalletAgent = (
         decode: decodeGetContactsToolInput,
         execute: async (context, input) =>
           Effect.runPromise(
-            executeGetContactsTool(toWalletAgentExecutionContext(context), input)
+            executeGetContactsTool(toWalletAgentExecutionContext(context, dependencies), input)
           )
       }),
       nlaTool<{}, GenericSigningToolInput, WalletSignatureResultOutput>({
@@ -776,7 +730,7 @@ export const createWalletAgent = (
         decode: decodeGenericSigningToolInput,
         execute: async (context, input) =>
           Effect.runPromise(
-            executeGenericSignatureTool(toWalletAgentExecutionContext(context), input)
+            executeGenericSignatureTool(toWalletAgentExecutionContext(context, dependencies), input)
           )
       }),
       nlaTool<{}, TransferStatusQuery, WalletTransferStatusResultOutput>({
@@ -786,7 +740,7 @@ export const createWalletAgent = (
         decode: decodeTransferStatusToolInput,
         execute: async (context, input) =>
           Effect.runPromise(
-            executeTransferStatusTool(toWalletAgentExecutionContext(context), input)
+            executeTransferStatusTool(toWalletAgentExecutionContext(context, dependencies), input)
           )
       }),
       nlaTool<{}, WalletAccountQuery, WalletAccountsResultOutput>({
@@ -796,7 +750,7 @@ export const createWalletAgent = (
         decode: decodeWalletAccountToolInput,
         execute: async (context, input) =>
           Effect.runPromise(
-            executeWalletAccountTool(toWalletAgentExecutionContext(context), input)
+            executeWalletAccountTool(toWalletAgentExecutionContext(context, dependencies), input)
           )
       })
     ]
@@ -804,11 +758,15 @@ export const createWalletAgent = (
 };
 
 const toWalletAgentExecutionContext = (
-  context: WalletAgentNlaToolContext
+  context: WalletAgentNlaToolContext,
+  dependencies: WalletAgentDependencies
 ): WalletAgentExecutionContext => ({
   sessionId: context.sessionId,
   turnId: requireWalletTurnId(context.turnId),
   clientId: context.clientId,
+  storage: dependencies.storage,
+  signing: dependencies.signing,
+  wallet: dependencies.wallet,
   activity: (activity) =>
     Effect.sync(() => {
       context.activity(activity);
@@ -827,6 +785,9 @@ interface WalletAgentExecutionContext {
   readonly sessionId: string;
   readonly turnId: string;
   readonly clientId: string;
+  readonly storage: WalletAgentStorageClient;
+  readonly signing: SigningCapabilityClient;
+  readonly wallet: WalletCapabilityClient;
   readonly activity: (activity: NlaActivityData) => Effect.Effect<void>;
 }
 
@@ -836,7 +797,7 @@ const executeTransferSignatureTool = (
 ): Effect.Effect<WalletTransferResultOutput, Error> =>
   Effect.gen(function* () {
     const pending = yield* createPendingTransfer(context, input);
-    yield* upsertTransactionRecord(createInitialTransactionRecord(pending));
+    yield* upsertTransactionRecord(context, createInitialTransactionRecord(pending));
     yield* emitTransactionActivity(
       context,
       pending.transactionId,
@@ -844,10 +805,10 @@ const executeTransferSignatureTool = (
       "awaiting_input"
     );
 
-    const resolution = yield* requestSignature(pending.signingRequest);
-    const transaction = yield* finalizeTransactionRecord(pending, resolution);
-    yield* upsertTransactionRecord(transaction);
-    yield* appendTransferHistory({
+    const resolution = yield* context.signing.requestSignature(pending.signingRequest);
+    const transaction = yield* finalizeTransactionRecord(context, pending, resolution);
+    yield* upsertTransactionRecord(context, transaction);
+    yield* appendTransferHistory(context, {
       ...pending,
       resolution
     });
@@ -869,7 +830,7 @@ const executeGenericSignatureTool = (
       "awaiting_input"
     );
 
-    const resolution = yield* requestSignature(pending.signingRequest);
+    const resolution = yield* context.signing.requestSignature(pending.signingRequest);
     yield* emitSigningActivity(
       context,
       pending.requestId,
@@ -887,34 +848,34 @@ const executeTransferStatusTool = (
   input: TransferStatusQuery
 ): Effect.Effect<WalletTransferStatusResultOutput, Error> =>
   Effect.map(
-    refreshTrackedTransactions(),
+    refreshTrackedTransactions(context),
     (transactions) => createTransferStatusResultOutput(input, transactions)
   );
 
 const executeManageContactsTool = (
-  _context: WalletAgentExecutionContext,
+  context: WalletAgentExecutionContext,
   input: ManageContactsInput
 ): Effect.Effect<WalletContactsResultOutput, Error> =>
-  manageWalletContacts(input);
+  manageWalletContacts(context, input);
 
 const executeGetContactsTool = (
-  _context: WalletAgentExecutionContext,
+  context: WalletAgentExecutionContext,
   input: GetContactsQuery
 ): Effect.Effect<WalletContactsResultOutput, Error> =>
-  answerContactQuery(input);
+  answerContactQuery(context, input);
 
 const executeWalletAccountTool = (
-  _context: WalletAgentExecutionContext,
+  context: WalletAgentExecutionContext,
   input: WalletAccountQuery
 ): Effect.Effect<WalletAccountsResultOutput, Error> =>
-  answerWalletAccountQuery(input);
+  answerWalletAccountQuery(context, input);
 
 const createPendingTransfer = (
-  context: Pick<WalletAgentExecutionContext, "sessionId" | "turnId" | "clientId">,
+  context: WalletAgentExecutionContext,
   input: ParsedTransferToolInput
 ): Effect.Effect<PendingTransferRequest, Error> =>
   Effect.gen(function* () {
-    const destination = yield* resolveTransferDestination(input);
+    const destination = yield* resolveTransferDestination(context, input);
     const source = yield* resolveTransferSource(context, input);
     return yield* createPendingTransferFromParsedToolInput(context, input, source, destination);
   });
@@ -976,6 +937,7 @@ const createPendingTransferFromParsedToolInput = (
   });
 
 const resolveTransferDestination = (
+  context: Pick<WalletAgentExecutionContext, "storage">,
   toolInput: ParsedTransferToolInput
 ): Effect.Effect<{
   readonly toAddress: string;
@@ -993,14 +955,14 @@ const resolveTransferDestination = (
     );
   }
 
-  return resolveSavedContactRecipient(toolInput.recipient, {
+  return resolveSavedContactRecipient(context, toolInput.recipient, {
     chainFamily: toolInput.chainFamily,
     chain: toolInput.chain
   });
 };
 
 const createPendingSigning = (
-  context: Pick<WalletAgentExecutionContext, "sessionId" | "turnId" | "clientId">,
+  context: WalletAgentExecutionContext,
   input: GenericSigningToolInput
 ): Effect.Effect<PendingSigningRequest, Error> =>
   Effect.gen(function* () {
@@ -1520,7 +1482,7 @@ function decodeGetContactsToolInput(input: unknown): GetContactsQuery {
 }
 
 const resolveTransferSource = (
-  context: Pick<WalletAgentExecutionContext, "sessionId" | "turnId" | "clientId">,
+  context: Pick<WalletAgentExecutionContext, "sessionId" | "turnId" | "clientId" | "wallet">,
   toolInput: ParsedTransferToolInput
 ): Effect.Effect<{
   readonly fromAddress: string;
@@ -1529,7 +1491,7 @@ const resolveTransferSource = (
   const explicitFromAddress = toolInput.fromAddress;
 
   if (explicitFromAddress) {
-    return resolveAccount({
+    return context.wallet.resolveAccount({
       chainFamily: toolInput.chainFamily,
       chain: toolInput.chain,
       requestedAddress: explicitFromAddress
@@ -1547,7 +1509,7 @@ const resolveTransferSource = (
     );
   }
 
-  return ensureAccount({
+  return context.wallet.ensureAccount({
     sessionId: context.sessionId,
     turnId: context.turnId,
     requestedByClientId: context.clientId,
@@ -1571,7 +1533,7 @@ const resolveTransferSource = (
 };
 
 const resolveSigningSource = (
-  context: Pick<WalletAgentExecutionContext, "sessionId" | "turnId" | "clientId">,
+  context: Pick<WalletAgentExecutionContext, "sessionId" | "turnId" | "clientId" | "wallet">,
   input: {
     readonly chainFamily: WalletChainFamily;
     readonly chain: string;
@@ -1585,7 +1547,7 @@ const resolveSigningSource = (
 }, Error> => {
   if (input.requestedAddress) {
     const requestedAddress = input.requestedAddress;
-    return resolveAccount({
+    return context.wallet.resolveAccount({
       chainFamily: input.chainFamily,
       chain: input.chain,
       requestedAddress
@@ -1603,7 +1565,7 @@ const resolveSigningSource = (
     );
   }
 
-  return ensureAccount({
+  return context.wallet.ensureAccount({
     sessionId: context.sessionId,
     turnId: context.turnId,
     requestedByClientId: context.clientId,
@@ -1787,23 +1749,26 @@ const stableJson = (value: unknown): string => {
 };
 
 const appendTransferHistory = (
+  context: Pick<WalletAgentExecutionContext, "storage">,
   entry: TransferHistoryEntry
 ): Effect.Effect<void, Error> =>
   Effect.gen(function* () {
-    const existing = yield* getJson({
+    const existing = yield* context.storage.getJson({
       scope: "install",
       key: TransferHistoryStorageKey
     });
     const history = decodeTransferHistory(existing);
-    yield* putJson({
+    yield* context.storage.putJson({
       scope: "install",
       key: TransferHistoryStorageKey,
       value: [...history, entry]
     });
   });
 
-const readTransactionLedger = (): Effect.Effect<ReadonlyArray<WalletTransactionRecord>, Error> =>
-  getJson({
+const readTransactionLedger = (
+  context: Pick<WalletAgentExecutionContext, "storage">
+): Effect.Effect<ReadonlyArray<WalletTransactionRecord>, Error> =>
+  context.storage.getJson({
     scope: "install",
     key: TransactionLedgerStorageKey
   }).pipe(
@@ -1811,11 +1776,12 @@ const readTransactionLedger = (): Effect.Effect<ReadonlyArray<WalletTransactionR
   );
 
 const upsertTransactionRecord = (
+  context: Pick<WalletAgentExecutionContext, "storage">,
   record: WalletTransactionRecord
 ): Effect.Effect<void, Error> =>
   Effect.gen(function* () {
-    const transactions = yield* readTransactionLedger();
-    yield* putJson({
+    const transactions = yield* readTransactionLedger(context);
+    yield* context.storage.putJson({
       scope: "install",
       key: TransactionLedgerStorageKey,
       value: [
@@ -1844,6 +1810,7 @@ const transitionTransactionRecord = (
 });
 
 const finalizeTransactionRecord = (
+  context: Pick<WalletAgentExecutionContext, "storage">,
   pending: PendingTransferRequest,
   resolution: SigningResolution
 ): Effect.Effect<WalletTransactionRecord, Error> => {
@@ -1863,7 +1830,7 @@ const finalizeTransactionRecord = (
   }
 
   return broadcastSignedTransaction(pending, resolution).pipe(
-    Effect.flatMap(waitForTransactionConfirmation)
+    Effect.flatMap((transaction) => waitForTransactionConfirmation(context, transaction))
   );
 };
 
@@ -1962,12 +1929,13 @@ const broadcastSignedTransaction = (
   );
 
 const refreshTrackedTransactions = (
+  context: Pick<WalletAgentExecutionContext, "storage">
 ): Effect.Effect<ReadonlyArray<WalletTransactionRecord>, Error> =>
   Effect.gen(function* () {
-    const transactions = yield* readTransactionLedger();
+    const transactions = yield* readTransactionLedger(context);
     const refreshed = yield* Effect.forEach(
       transactions,
-      (transaction) => refreshTransactionRecord(transaction),
+      (transaction) => refreshTransactionRecord(context, transaction),
       {
         concurrency: 1
       }
@@ -1977,6 +1945,7 @@ const refreshTrackedTransactions = (
   });
 
 const waitForTransactionConfirmation = (
+  context: Pick<WalletAgentExecutionContext, "storage">,
   transaction: WalletTransactionRecord
 ): Effect.Effect<WalletTransactionRecord, Error> => {
   if (transaction.status !== "submitted" || !transaction.txHash) {
@@ -2003,7 +1972,7 @@ const waitForTransactionConfirmation = (
       return Effect.succeed(current);
     }
 
-    return refreshTransactionRecord(current).pipe(
+    return refreshTransactionRecord(context, current).pipe(
       Effect.flatMap((next) => {
         if (next.status !== "submitted") {
           return Effect.succeed(next);
@@ -2024,6 +1993,7 @@ const waitForTransactionConfirmation = (
 };
 
 const refreshTransactionRecord = (
+  context: Pick<WalletAgentExecutionContext, "storage">,
   transaction: WalletTransactionRecord
 ): Effect.Effect<WalletTransactionRecord, Error> => {
   if (transaction.status !== "submitted" || !transaction.txHash) {
@@ -2039,7 +2009,7 @@ const refreshTransactionRecord = (
   return Effect.gen(function* () {
     const next = yield* refreshSubmittedTransactionRecord(transaction, chain);
 
-    yield* upsertTransactionRecord(next);
+    yield* upsertTransactionRecord(context, next);
     return next;
   }).pipe(
     Effect.catchAll((error) =>
@@ -2404,10 +2374,11 @@ function decodeWalletAccountToolInput(input: unknown): WalletAccountQuery {
 }
 
 const answerWalletAccountQuery = (
+  context: Pick<WalletAgentExecutionContext, "wallet">,
   query: WalletAccountQuery
 ): Effect.Effect<WalletAccountsResultOutput, Error> =>
   Effect.gen(function* () {
-    const accounts = yield* listAccounts({
+    const accounts = yield* context.wallet.listAccounts({
       chainFamily: query.chainFamily,
       chain: query.chain
     });
@@ -2432,7 +2403,7 @@ const answerWalletAccountQuery = (
     }
 
     if (query.chainFamily) {
-      const resolved = yield* Effect.either(resolveAccount({
+      const resolved = yield* Effect.either(context.wallet.resolveAccount({
         chainFamily: query.chainFamily,
         chain: query.chain
       }));
@@ -2570,17 +2541,19 @@ const representativeWalletAccounts = (
 };
 
 const manageWalletContacts = (
+  context: Pick<WalletAgentExecutionContext, "storage">,
   input: ManageContactsInput
 ): Effect.Effect<WalletContactsResultOutput, Error> =>
   input.operation === "add"
-    ? addWalletContact(input)
-    : updateWalletContact(input);
+    ? addWalletContact(context, input)
+    : updateWalletContact(context, input);
 
 const addWalletContact = (
+  context: Pick<WalletAgentExecutionContext, "storage">,
   input: Extract<ManageContactsInput, { readonly operation: "add" }>
 ): Effect.Effect<WalletContactsResultOutput, Error> =>
   Effect.gen(function* () {
-    const contacts = yield* readWalletContacts();
+    const contacts = yield* readWalletContacts(context);
     const resolvedScope = resolveWalletContactScope({
       address: input.address,
       chainFamily: input.chainFamily,
@@ -2606,7 +2579,7 @@ const addWalletContact = (
       );
     }
 
-    yield* writeWalletContacts([...contacts, contact]);
+    yield* writeWalletContacts(context, [...contacts, contact]);
     return {
       kind: "wallet.contacts_result",
       operation: "add",
@@ -2616,10 +2589,11 @@ const addWalletContact = (
   });
 
 const updateWalletContact = (
+  context: Pick<WalletAgentExecutionContext, "storage">,
   input: Extract<ManageContactsInput, { readonly operation: "update" }>
 ): Effect.Effect<WalletContactsResultOutput, Error> =>
   Effect.gen(function* () {
-    const contacts = yield* readWalletContacts();
+    const contacts = yield* readWalletContacts(context);
     const matches = findWalletContactsByName(contacts, input.targetName, {
       chainFamily: input.targetChainFamily,
       chain: input.targetChain
@@ -2682,7 +2656,7 @@ const updateWalletContact = (
     const updated = contacts.map((candidate, index) =>
       index === match.index ? next : candidate
     );
-    yield* writeWalletContacts(updated);
+    yield* writeWalletContacts(context, updated);
     return {
       kind: "wallet.contacts_result",
       operation: "update",
@@ -2692,12 +2666,13 @@ const updateWalletContact = (
   });
 
 const answerContactQuery = (
+  context: Pick<WalletAgentExecutionContext, "storage">,
   query: GetContactsQuery
 ): Effect.Effect<WalletContactsResultOutput, Error> =>
   Effect.gen(function* () {
     const contacts = sortWalletContacts(
       filterWalletContactsByScope(
-        yield* readWalletContacts(),
+        yield* readWalletContacts(context),
         {
           chainFamily: query.chainFamily,
           chain: query.chain
@@ -2754,6 +2729,7 @@ const answerContactQuery = (
   });
 
 const resolveSavedContactRecipient = (
+  context: Pick<WalletAgentExecutionContext, "storage">,
   recipientName: string,
   scope: {
     readonly chainFamily: WalletChainFamily;
@@ -2764,7 +2740,7 @@ const resolveSavedContactRecipient = (
   readonly recipientName: string;
 }, Error> =>
   Effect.gen(function* () {
-    const contacts = yield* readWalletContacts();
+    const contacts = yield* readWalletContacts(context);
     const byName = contacts.filter((contact) => walletContactNameMatches(contact, recipientName));
     if (byName.length === 0) {
       return yield* Effect.fail(
@@ -2823,8 +2799,10 @@ const resolveSavedContactRecipient = (
     );
   });
 
-const readWalletContacts = (): Effect.Effect<ReadonlyArray<WalletContactRecord>, Error> =>
-  getJson({
+const readWalletContacts = (
+  context: Pick<WalletAgentExecutionContext, "storage">
+): Effect.Effect<ReadonlyArray<WalletContactRecord>, Error> =>
+  context.storage.getJson({
     scope: "install",
     key: WalletContactsStorageKey
   }).pipe(
@@ -2832,9 +2810,10 @@ const readWalletContacts = (): Effect.Effect<ReadonlyArray<WalletContactRecord>,
   );
 
 const writeWalletContacts = (
+  context: Pick<WalletAgentExecutionContext, "storage">,
   contacts: ReadonlyArray<WalletContactRecord>
 ): Effect.Effect<void, Error> =>
-  putJson({
+  context.storage.putJson({
     scope: "install",
     key: WalletContactsStorageKey,
     value: sortWalletContacts(contacts)
