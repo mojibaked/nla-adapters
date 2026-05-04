@@ -73,7 +73,13 @@ const createDependencies = (account) => ({
   wallet: {
     listAccounts: () => Effect.succeed([account]),
     resolveAccount: () => Effect.succeed(account),
-    ensureAccount: () => Effect.succeed(account)
+    ensureAccount: () => Effect.succeed(account),
+    getBalances: (query) => Effect.succeed({
+      query,
+      status: "ok",
+      balances: [],
+      accounts: [account]
+    })
   }
 });
 

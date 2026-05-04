@@ -167,6 +167,41 @@ export interface WalletAccountEnsureRequest extends WalletAccountResolveRequest 
   readonly body?: string;
 }
 
+export type WalletBalanceQueryKind = "default" | "list";
+
+export interface WalletBalanceRequest {
+  readonly kind: WalletBalanceQueryKind;
+  readonly chainFamily?: WalletChainFamily;
+  readonly chain?: string;
+  readonly address?: string;
+  readonly assetSymbol?: string;
+  readonly tokenAddress?: string;
+  readonly includeTokens?: boolean;
+  readonly eligibleDeviceIds?: ReadonlyArray<string>;
+}
+
+export interface WalletBalanceView {
+  readonly chain: string;
+  readonly chainFamily: WalletChainFamily;
+  readonly address: string;
+  readonly assetSymbol: string;
+  readonly rawAmount: string;
+  readonly decimals: number;
+  readonly formattedAmount: string;
+  readonly isNative: boolean;
+  readonly tokenAddress?: string;
+  readonly assetName?: string;
+}
+
+export interface WalletBalancesResult {
+  readonly query: WalletBalanceRequest;
+  readonly status: "ok" | "not_found";
+  readonly balances: ReadonlyArray<WalletBalanceView>;
+  readonly accounts: ReadonlyArray<WalletAccountCandidate>;
+  readonly omittedTokenBalances?: number;
+  readonly warnings?: ReadonlyArray<string>;
+}
+
 export interface WalletCapabilityClient {
   readonly listAccounts: (
     request?: WalletAccountListRequest
@@ -177,4 +212,7 @@ export interface WalletCapabilityClient {
   readonly ensureAccount: (
     request: WalletAccountEnsureRequest
   ) => Effect.Effect<WalletAccountCandidate, Error>;
+  readonly getBalances: (
+    request: WalletBalanceRequest
+  ) => Effect.Effect<WalletBalancesResult, Error>;
 }

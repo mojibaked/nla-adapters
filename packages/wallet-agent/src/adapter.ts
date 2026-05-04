@@ -17,6 +17,9 @@ import type {
   SigningResolution,
   SolanaTransactionSigningRequest,
   WalletAccountCandidate,
+  WalletBalanceQueryKind,
+  WalletBalanceRequest,
+  WalletBalancesResult,
   WalletCapabilityClient,
   WalletChainFamily
 } from "@nla-adapters/contracts";
@@ -32,14 +35,17 @@ import {
 } from "@solana/web3.js";
 import {
   createPublicClient,
+  encodeFunctionData,
   hexToBytes,
   http,
   isHex,
   parseEther,
+  parseUnits,
   type Chain,
   type Hex
 } from "viem";
 import {
+  base,
   mainnet,
   polygon,
   sepolia
@@ -48,13 +54,38 @@ import {
 const TransferHistoryStorageKey = "wallet.transferHistory";
 const TransactionLedgerStorageKey = "wallet.transactions";
 const WalletContactsStorageKey = "wallet.contacts";
+const BalanceReadMarkerStorageKey = "wallet.balanceReadMarker";
 const EvmAddressPattern = /^0x[a-fA-F0-9]{40}$/;
 const SolanaAddressPattern = /^[1-9A-HJ-NP-Za-km-z]{32,44}$/;
 const DefaultPublicAlchemyApiKey = "GwaWJvKszxLtb3Ay30znz";
 const NativeTransferGas = 21_000n;
+const Erc20TransferGasFallback = 100_000n;
 const SolanaLamportsPerSol = 1_000_000_000n;
 const DefaultConfirmationWaitTimeoutMs = 15_000;
 const DefaultConfirmationPollIntervalMs = 1_000;
+const Erc20TransferAbi = [
+  {
+    type: "function",
+    name: "transfer",
+    stateMutability: "nonpayable",
+    inputs: [
+      {
+        name: "to",
+        type: "address"
+      },
+      {
+        name: "amount",
+        type: "uint256"
+      }
+    ],
+    outputs: [
+      {
+        name: "",
+        type: "bool"
+      }
+    ]
+  }
+] as const;
 
 interface TransferToolInput {
   readonly amount?: unknown;
@@ -63,18 +94,27 @@ interface TransferToolInput {
   readonly toAddress?: unknown;
   readonly recipient?: unknown;
   readonly chain?: unknown;
+  readonly tokenAddress?: unknown;
   readonly note?: unknown;
 }
 
 interface ParsedTransferToolInput {
   readonly chain: string;
+  readonly chainExplicit: boolean;
   readonly chainFamily: WalletChainFamily;
   readonly assetSymbol: string;
   readonly amount: string;
   readonly fromAddress?: string;
   readonly toAddress?: string;
   readonly recipient?: string;
+  readonly tokenAddress?: string;
   readonly note?: string;
+}
+
+interface ResolvedTransferAsset {
+  readonly assetSymbol: string;
+  readonly tokenAddress?: string;
+  readonly tokenDecimals?: number;
 }
 
 interface GenericSigningToolInput {
@@ -173,6 +213,29 @@ interface WalletTransferResultOutput {
   readonly transfer: WalletTransferView;
 }
 
+interface WalletTransferPreflightRequiredOutput {
+  readonly kind: "wallet.transfer_preflight_required";
+  readonly status: "balance_read_required";
+  readonly message: string;
+  readonly requiredTool: "get_wallet_balances";
+  readonly query: {
+    readonly chainFamily?: WalletChainFamily;
+    readonly chain?: string;
+    readonly address?: string;
+    readonly assetSymbol?: string;
+    readonly tokenAddress?: string;
+  };
+  readonly attemptedTransfer: {
+    readonly chain: string;
+    readonly assetSymbol: string;
+    readonly amount: string;
+    readonly fromAddress?: string;
+    readonly toAddress?: string;
+    readonly recipient?: string;
+    readonly tokenAddress?: string;
+  };
+}
+
 interface WalletSignatureRequestView {
   readonly requestId: string;
   readonly requestKind: SigningRequest["kind"];
@@ -238,7 +301,6 @@ interface WalletAccountView {
   readonly derivationPath?: string;
   readonly derivationProfile?: string;
   readonly label?: string;
-  readonly isDefault?: boolean;
   readonly eligibleDeviceIds: ReadonlyArray<string>;
 }
 
@@ -247,15 +309,25 @@ interface WalletAccountsResultOutput {
   readonly query: WalletAccountQuery;
   readonly status: "ok" | "not_found" | "ambiguous";
   readonly accounts: ReadonlyArray<WalletAccountView>;
-  readonly defaultAccount?: WalletAccountView;
+  readonly currentAccount?: WalletAccountView;
+}
+
+type WalletBalanceQuery = WalletBalanceRequest & {
+  readonly includeAllConnected?: boolean;
+};
+
+interface WalletBalancesResultOutput extends WalletBalancesResult {
+  readonly kind: "wallet.balances_result";
 }
 
 type WalletAgentToolOutput =
   | WalletTransferResultOutput
+  | WalletTransferPreflightRequiredOutput
   | WalletSignatureResultOutput
   | WalletTransferStatusResultOutput
   | WalletContactsResultOutput
-  | WalletAccountsResultOutput;
+  | WalletAccountsResultOutput
+  | WalletBalancesResultOutput;
 
 type WalletAgentStorageClient = Pick<EffectStorageClient, "getJson" | "putJson">;
 
@@ -278,6 +350,8 @@ interface PendingTransferRequest {
   readonly amount: string;
   readonly fromAddress: string;
   readonly toAddress: string;
+  readonly tokenAddress?: string;
+  readonly tokenDecimals?: number;
   readonly note?: string;
   readonly digest: string;
   readonly requestedAt: string;
@@ -326,7 +400,7 @@ interface WalletTransactionRecord extends PendingTransferRequest {
   readonly error?: WalletTransactionError;
 }
 
-type TransferChainKey = "ethereum" | "sepolia" | "polygon" | "solana";
+type TransferChainKey = "ethereum" | "base" | "sepolia" | "polygon" | "solana";
 
 interface TransferChainConfigBase {
   readonly key: TransferChainKey;
@@ -361,6 +435,15 @@ const TransferChains: ReadonlyArray<TransferChainConfig> = [
     url: (apiKey) => `https://eth-mainnet.g.alchemy.com/v2/${apiKey}`
   },
   {
+    key: "base",
+    chainFamily: "evm",
+    chain: base,
+    nativeSymbol: "ETH",
+    aliases: ["base", "base-mainnet", "base-eth", "eth-base"],
+    rpcUrlEnv: "WALLET_AGENT_RPC_URL_BASE",
+    url: (apiKey) => `https://base-mainnet.g.alchemy.com/v2/${apiKey}`
+  },
+  {
     key: "sepolia",
     chainFamily: "evm",
     chain: sepolia,
@@ -392,9 +475,12 @@ const TransferChains: ReadonlyArray<TransferChainConfig> = [
 const TransferSignatureTool: WalletAgentToolSpec = {
   name: "request_transfer_signature",
   description: [
-    "Prepare a native-token transfer signature request.",
-    "Use this when the user wants to send crypto and the message includes amount plus either a recipient address or a saved contact name.",
-    "If the sender address is omitted, resolve a default wallet account from the host when one is available.",
+    "Prepare a transfer signature request.",
+    "Use this when the user wants to send supported crypto and the message includes amount plus either a recipient address or a saved contact name.",
+    "Supports native EVM transfers, ERC-20 transfers, and native Solana transfers.",
+    "Before using this tool, call get_wallet_balances at least once in the current turn unless the user supplied an explicit sender, asset, and chain and the balance was already checked after the most recent transaction.",
+    "Respect the chain supplied to this tool; the tool validates balances only on that chain.",
+    "If the sender address is omitted, use the requesting client's current wallet only when exactly one matching account is available.",
     "Saved contacts can be referenced through the recipient field.",
     "This prepares a locally tracked transfer request.",
     "When the signer returns a broadcastable transaction payload, the host submits it and tracks its status."
@@ -414,7 +500,7 @@ const TransferSignatureTool: WalletAgentToolSpec = {
       },
       fromAddress: {
         type: "string",
-        description: "Optional sender wallet address. Omit to use a resolved default wallet account."
+        description: "Optional sender wallet address. Omit only when the requesting client has exactly one matching current wallet account."
       },
       toAddress: {
         type: "string",
@@ -426,7 +512,11 @@ const TransferSignatureTool: WalletAgentToolSpec = {
       },
       chain: {
         type: "string",
-        description: "Chain name or identifier, for example sepolia"
+        description: "Chain name or identifier, for example base or sepolia"
+      },
+      tokenAddress: {
+        type: "string",
+        description: "Optional ERC-20 token contract address when the token symbol is ambiguous."
       },
       note: {
         type: "string",
@@ -480,7 +570,7 @@ const ManageContactsTool: WalletAgentToolSpec = {
       },
       chain: {
         type: "string",
-        description: "Optional chain or network label such as ethereum, sepolia, polygon, or solana."
+        description: "Optional chain or network label such as ethereum, base, sepolia, polygon, or solana."
       },
       note: {
         type: "string",
@@ -515,7 +605,7 @@ const GetContactsTool: WalletAgentToolSpec = {
       },
       chain: {
         type: "string",
-        description: "Optional chain filter such as ethereum, sepolia, polygon, or solana."
+        description: "Optional chain filter such as ethereum, base, sepolia, polygon, or solana."
       }
     }
   }
@@ -527,8 +617,8 @@ const GenericSignatureTool: WalletAgentToolSpec = {
     "Prepare a non-transfer wallet signing request.",
     "Use this when the user wants to sign a digest, message, typed data payload, or prebuilt transaction.",
     "Supported kinds are digest, evm.personal_message, evm.typed_data, evm.transaction, solana.message, and solana.transaction.",
-    "If the signer address is omitted, resolve a default wallet account for the request chain family when one is available.",
-    "Do not use this tool for simple native token sends; use request_transfer_signature instead."
+    "If the signer address is omitted, use the requesting client's current wallet only when exactly one matching account is available.",
+    "Do not use this tool for simple token sends; use request_transfer_signature instead."
   ].join(" "),
   inputSchema: {
     type: "object",
@@ -548,11 +638,11 @@ const GenericSignatureTool: WalletAgentToolSpec = {
       },
       chain: {
         type: "string",
-        description: "Chain or network name, for example ethereum, sepolia, polygon, or solana."
+        description: "Chain or network name, for example ethereum, base, sepolia, polygon, or solana."
       },
       address: {
         type: "string",
-        description: "Optional signer wallet address. Omit to resolve a default account."
+        description: "Optional signer wallet address. Omit only when the requesting client has exactly one matching current wallet account."
       },
       chainId: {
         type: "integer",
@@ -638,7 +728,7 @@ const WalletAccountTool: WalletAgentToolSpec = {
   name: "get_wallet_accounts",
   description: [
     "Look up connected wallet accounts published by paired signer devices.",
-    "Use this for questions about wallet addresses, default wallet accounts, or which wallets are connected."
+    "Use this for questions about wallet addresses, current wallet accounts, or which wallets are connected."
   ].join(" "),
   inputSchema: {
     type: "object",
@@ -655,7 +745,53 @@ const WalletAccountTool: WalletAgentToolSpec = {
       },
       chain: {
         type: "string",
-        description: "Optional specific chain scope such as ethereum, sepolia, polygon, or solana."
+        description: "Optional specific chain scope such as ethereum, base, sepolia, polygon, or solana."
+      },
+      includeAllConnected: {
+        type: "boolean",
+        description: "Set true only when the user explicitly asks for all connected wallets across devices."
+      }
+    }
+  }
+};
+
+const WalletBalanceTool: WalletAgentToolSpec = {
+  name: "get_wallet_balances",
+  description: [
+    "Read all wallet balances for an account from configured chain RPC endpoints.",
+    "Use this for questions about wallet balances, funds, holdings, native tokens, ERC-20 tokens, or SPL token balances.",
+    "For general balance questions, call this tool with an empty object.",
+    "If no address is provided, read balances for the requesting client's connected wallet accounts.",
+    "Only set chain, assetSymbol, or tokenAddress when the user explicitly narrows the balance request."
+  ].join(" "),
+  inputSchema: {
+    type: "object",
+    additionalProperties: false,
+    properties: {
+      chainFamily: {
+        type: "string",
+        enum: ["evm", "solana"],
+        description: "Optional account-family filter. Omit for general balance requests."
+      },
+      chain: {
+        type: "string",
+        description: "Optional chain scope such as ethereum, base, sepolia, polygon, or solana. Omit to scan supported chains."
+      },
+      address: {
+        type: "string",
+        description: "Optional wallet address. Omit to use connected wallet accounts."
+      },
+      assetSymbol: {
+        type: "string",
+        description: "Optional asset symbol filter such as ETH, POL, SOL, or an ERC-20 symbol."
+      },
+      tokenAddress: {
+        type: "string",
+        description: "Optional ERC-20 contract address or SPL token mint address."
+      },
+      includeAllConnected: {
+        type: "boolean",
+        description: "Set true only when the user explicitly asks for all connected wallet balances across devices."
       }
     }
   }
@@ -672,18 +808,23 @@ export const createWalletAgent = (
     description: "Portable wallet agent that uses injected wallet, signing, and storage capabilities.",
     instructions: [
       "You help the user manage wallet contacts and prepare wallet signing requests.",
-      "Use the request_transfer_signature tool when the user clearly wants to send native tokens and provides enough detail to prepare the transfer.",
+      "Use the request_transfer_signature tool when the user clearly wants to send supported crypto and provides enough detail to prepare the transfer.",
       "The transfer tool accepts either a direct recipient address or a saved contact name.",
       "Use the manage_contacts tool when the user wants to add or update a saved contact.",
       "Use the get_contacts tool when the user wants to list saved contacts or retrieve a saved contact by name.",
       "Use the request_signature_operation tool when the user wants to sign a digest, message, typed data payload, or a prebuilt transaction.",
       "Use the get_transfer_status tool for questions about whether a transfer worked, failed, was submitted, was confirmed, or for recent transfer history.",
-      "Use the get_wallet_accounts tool for questions about wallet addresses, defaults, or connected accounts.",
+      "Use the get_wallet_balances tool for questions about wallet balances, funds, holdings, native token balances, ERC-20 balances, or SPL token balances.",
+      "Use the get_wallet_accounts tool for questions about wallet addresses, current wallet accounts, or connected accounts.",
+      "Before requesting any transfer signature, read wallet balances in the current turn unless the user supplied an explicit sender, asset, and chain and balances were already checked after the most recent transaction.",
+      "For token sends where the user does not name a chain, first read balances and choose the chain that contains the requested token balance; do not guess a chain from the account family alone.",
+      "After a transaction is submitted or confirmed, read balances again before preparing another transfer.",
       "Never invent tool names beyond the tools that were provided.",
       "Never invent contact names, saved addresses, wallet addresses, amounts, assets, or chains.",
       "Do not invent wallet addresses, amounts, assets, or chains.",
       "If the request is missing critical fields, respond directly and say what is missing.",
-      "A sender address is not required if the host can resolve a default wallet account for the requested chain family.",
+      "A sender address is not required only if the requesting client has exactly one matching current wallet account.",
+      "By default, wallet account and balance tools are scoped to the requesting client. Set includeAllConnected=true only when the user explicitly asks for all connected wallets across devices.",
       "When possible, prepare a broadcastable native-token transaction for the signer so the host can submit it after approval.",
       "If the signer only returns a signature and not a signed payload, the host should keep the transfer tracked locally.",
       "Do not route transfers through the generic signing tool unless the user explicitly provides a raw transaction payload to sign."
@@ -693,7 +834,7 @@ export const createWalletAgent = (
     maxIterations: 6,
     memory: dependencies.conversationMemory,
     tools: [
-      nlaTool<{}, ParsedTransferToolInput, WalletTransferResultOutput>({
+      nlaTool<{}, ParsedTransferToolInput, WalletTransferResultOutput | WalletTransferPreflightRequiredOutput>({
         name: TransferSignatureTool.name,
         description: TransferSignatureTool.description,
         inputSchema: TransferSignatureTool.inputSchema,
@@ -741,6 +882,16 @@ export const createWalletAgent = (
         execute: async (context, input) =>
           Effect.runPromise(
             executeTransferStatusTool(toWalletAgentExecutionContext(context, dependencies), input)
+          )
+      }),
+      nlaTool<{}, WalletBalanceQuery, WalletBalancesResultOutput>({
+        name: WalletBalanceTool.name,
+        description: WalletBalanceTool.description,
+        inputSchema: WalletBalanceTool.inputSchema,
+        decode: decodeWalletBalanceToolInput,
+        execute: async (context, input) =>
+          Effect.runPromise(
+            executeWalletBalanceTool(toWalletAgentExecutionContext(context, dependencies), input)
           )
       }),
       nlaTool<{}, WalletAccountQuery, WalletAccountsResultOutput>({
@@ -794,8 +945,13 @@ interface WalletAgentExecutionContext {
 const executeTransferSignatureTool = (
   context: WalletAgentExecutionContext,
   input: ParsedTransferToolInput
-): Effect.Effect<WalletTransferResultOutput, Error> =>
+): Effect.Effect<WalletTransferResultOutput | WalletTransferPreflightRequiredOutput, Error> =>
   Effect.gen(function* () {
+    const balanceRead = yield* hasBalanceReadForTurn(context);
+    if (!balanceRead) {
+      return createBalanceReadRequiredOutput(input);
+    }
+
     const pending = yield* createPendingTransfer(context, input);
     yield* upsertTransactionRecord(context, createInitialTransactionRecord(pending));
     yield* emitTransactionActivity(
@@ -870,6 +1026,65 @@ const executeWalletAccountTool = (
 ): Effect.Effect<WalletAccountsResultOutput, Error> =>
   answerWalletAccountQuery(context, input);
 
+const executeWalletBalanceTool = (
+  context: WalletAgentExecutionContext,
+  input: WalletBalanceQuery
+): Effect.Effect<WalletBalancesResultOutput, Error> =>
+  Effect.gen(function* () {
+    const result = yield* answerWalletBalanceQuery(context, input);
+    yield* markBalanceReadForTurn(context);
+    return result;
+  });
+
+const hasBalanceReadForTurn = (
+  context: Pick<WalletAgentExecutionContext, "turnId" | "storage">
+): Effect.Effect<boolean, Error> =>
+  Effect.gen(function* () {
+    const marker = yield* context.storage.getJson({
+      scope: "session",
+      key: BalanceReadMarkerStorageKey
+    });
+    const record = optionalRecord(marker, "balanceReadMarker");
+    return record ? optionalTrimmedString(record.turnId) === context.turnId : false;
+  });
+
+const markBalanceReadForTurn = (
+  context: Pick<WalletAgentExecutionContext, "turnId" | "storage">
+): Effect.Effect<void, Error> =>
+  context.storage.putJson({
+    scope: "session",
+    key: BalanceReadMarkerStorageKey,
+    value: {
+      turnId: context.turnId,
+      readAt: new Date().toISOString()
+    }
+  });
+
+const createBalanceReadRequiredOutput = (
+  input: ParsedTransferToolInput
+): WalletTransferPreflightRequiredOutput => ({
+  kind: "wallet.transfer_preflight_required",
+  status: "balance_read_required",
+  message: "You must read balances before performing a transfer.",
+  requiredTool: "get_wallet_balances",
+  query: {
+    chainFamily: input.chainFamily,
+    chain: input.chainExplicit ? input.chain : undefined,
+    address: input.fromAddress,
+    assetSymbol: input.assetSymbol,
+    tokenAddress: input.tokenAddress
+  },
+  attemptedTransfer: {
+    chain: input.chain,
+    assetSymbol: input.assetSymbol,
+    amount: input.amount,
+    fromAddress: input.fromAddress,
+    toAddress: input.toAddress,
+    recipient: input.recipient,
+    tokenAddress: input.tokenAddress
+  }
+});
+
 const createPendingTransfer = (
   context: WalletAgentExecutionContext,
   input: ParsedTransferToolInput
@@ -877,7 +1092,8 @@ const createPendingTransfer = (
   Effect.gen(function* () {
     const destination = yield* resolveTransferDestination(context, input);
     const source = yield* resolveTransferSource(context, input);
-    return yield* createPendingTransferFromParsedToolInput(context, input, source, destination);
+    const asset = yield* resolveTransferAsset(context, input, source);
+    return yield* createPendingTransferFromParsedToolInput(context, input, source, destination, asset);
   });
 
 const createPendingTransferFromParsedToolInput = (
@@ -890,19 +1106,21 @@ const createPendingTransferFromParsedToolInput = (
   destination: {
     readonly toAddress: string;
     readonly recipientName?: string;
-  }
+  },
+  asset: ResolvedTransferAsset
 ): Effect.Effect<PendingTransferRequest, Error> =>
   Effect.gen(function* () {
     const requestedAt = new Date().toISOString();
     const requestId = `sigreq:${context.turnId}`;
     const transactionId = `tx:${requestId}`;
     const preview = {
-      type: "native-transfer",
+      type: asset.tokenAddress ? "erc20-transfer" : "native-transfer",
       chain: toolInput.chain,
-      assetSymbol: toolInput.assetSymbol,
+      assetSymbol: asset.assetSymbol,
       amount: toolInput.amount,
       fromAddress: source.fromAddress,
       toAddress: destination.toAddress,
+      ...(asset.tokenAddress ? { tokenAddress: asset.tokenAddress } : {}),
       ...(destination.recipientName ? { recipientName: destination.recipientName } : {}),
       ...(toolInput.note ? { note: toolInput.note } : {}),
       requestedByClientId: context.clientId
@@ -915,10 +1133,12 @@ const createPendingTransferFromParsedToolInput = (
       turnId: context.turnId,
       requestedByClientId: context.clientId,
       chain: toolInput.chain,
-      assetSymbol: toolInput.assetSymbol,
+      assetSymbol: asset.assetSymbol,
       amount: toolInput.amount,
       fromAddress: source.fromAddress,
       toAddress: destination.toAddress,
+      tokenAddress: asset.tokenAddress,
+      tokenDecimals: asset.tokenDecimals,
       note: toolInput.note,
       digest: createDigest({
         requestId,
@@ -1241,7 +1461,7 @@ const prepareSigningRequest = (
     return Effect.succeed(createLegacyDigestSigningRequest(pending));
   }
 
-  if (pending.assetSymbol !== chain.nativeSymbol) {
+  if (chain.chainFamily === "solana" && pending.assetSymbol !== chain.nativeSymbol) {
     return Effect.fail(
       new Error(`Host-side broadcast currently supports only ${chain.nativeSymbol} on ${pending.chain}`)
     );
@@ -1286,7 +1506,9 @@ const prepareEvmTransactionSigningRequest = (
         blockTag: "pending"
       });
       const gasPrice = await client.getGasPrice();
-      const value = parseEther(pending.amount);
+      const transaction = pending.tokenAddress
+        ? await createErc20TransferTransaction(pending, chain, gasPrice, nonce)
+        : createNativeEvmTransferTransaction(pending, chain, gasPrice, nonce);
 
       return {
         kind: "evm.transaction",
@@ -1296,15 +1518,7 @@ const prepareEvmTransactionSigningRequest = (
         chain: pending.chain,
         address: pending.fromAddress,
         chainId: chain.chain.id,
-        transaction: {
-          to: pending.toAddress,
-          nonce,
-          gas: NativeTransferGas.toString(),
-          gasPrice: gasPrice.toString(),
-          value: value.toString(),
-          chainId: chain.chain.id,
-          type: "legacy"
-        },
+        transaction,
         preview: pending.preview,
         custody: "client-only-local",
         requestedAt: pending.requestedAt,
@@ -1314,6 +1528,69 @@ const prepareEvmTransactionSigningRequest = (
     },
     catch: (error) => error instanceof Error ? error : new Error(String(error))
   });
+
+const createNativeEvmTransferTransaction = (
+  pending: Omit<PendingTransferRequest, "signingRequest">,
+  chain: EvmChainConfig,
+  gasPrice: bigint,
+  nonce: number
+): Readonly<Record<string, unknown>> => {
+  const value = parseEther(pending.amount);
+
+  return {
+    to: pending.toAddress,
+    nonce,
+    gas: NativeTransferGas.toString(),
+    gasPrice: gasPrice.toString(),
+    value: value.toString(),
+    chainId: chain.chain.id,
+    type: "legacy"
+  };
+};
+
+const createErc20TransferTransaction = async (
+  pending: Omit<PendingTransferRequest, "signingRequest">,
+  chain: EvmChainConfig,
+  gasPrice: bigint,
+  nonce: number
+): Promise<Readonly<Record<string, unknown>>> => {
+  if (!pending.tokenAddress || pending.tokenDecimals === undefined) {
+    throw new Error(`ERC-20 transfer details are missing for ${pending.assetSymbol} on ${pending.chain}`);
+  }
+
+  const client = createEvmClient(chain);
+  const from = normalizeHex(pending.fromAddress, "pending.fromAddress");
+  const tokenAddress = normalizeHex(pending.tokenAddress, "pending.tokenAddress");
+  const amount = parseUnits(pending.amount, pending.tokenDecimals);
+  const data = encodeFunctionData({
+    abi: Erc20TransferAbi,
+    functionName: "transfer",
+    args: [
+      normalizeHex(pending.toAddress, "pending.toAddress"),
+      amount
+    ]
+  });
+  const estimatedGas = await client.estimateGas({
+    account: from,
+    to: tokenAddress,
+    data,
+    value: 0n
+  }).catch(() => Erc20TransferGasFallback);
+  const gas = estimatedGas > 0n
+    ? (estimatedGas * 12n) / 10n
+    : Erc20TransferGasFallback;
+
+  return {
+    to: tokenAddress,
+    nonce,
+    gas: gas.toString(),
+    gasPrice: gasPrice.toString(),
+    value: "0",
+    data,
+    chainId: chain.chain.id,
+    type: "legacy"
+  };
+};
 
 const prepareSolanaTransactionSigningRequest = (
   pending: Omit<PendingTransferRequest, "signingRequest">,
@@ -1366,6 +1643,7 @@ function decodeTransferToolInput(input: unknown): ParsedTransferToolInput {
   const rawFromAddress = optionalTrimmedString(record.fromAddress);
   const rawToAddress = optionalTrimmedString(record.toAddress);
   const rawRecipient = optionalTrimmedString(record.recipient);
+  const rawTokenAddress = optionalTrimmedString(record.tokenAddress);
   const inferredRecipientAddress = rawRecipient && inferChainFamilyFromAddress(rawRecipient)
     ? rawRecipient
     : undefined;
@@ -1382,6 +1660,9 @@ function decodeTransferToolInput(input: unknown): ParsedTransferToolInput {
   const fromAddress = record.fromAddress === undefined
     ? undefined
     : requireWalletAddress(record.fromAddress, "fromAddress", chainFamily);
+  const tokenAddress = rawTokenAddress
+    ? requireWalletAddress(rawTokenAddress, "tokenAddress", "evm")
+    : undefined;
   const toAddress = candidateToAddress
     ? requireWalletAddress(
         candidateToAddress,
@@ -1402,12 +1683,14 @@ function decodeTransferToolInput(input: unknown): ParsedTransferToolInput {
 
   return {
     chain,
+    chainExplicit: Boolean(rawChain),
     chainFamily,
     assetSymbol,
     amount,
     fromAddress,
     toAddress,
     recipient,
+    tokenAddress,
     note
   };
 }
@@ -1509,28 +1792,155 @@ const resolveTransferSource = (
     );
   }
 
-  return context.wallet.ensureAccount({
-    sessionId: context.sessionId,
-    turnId: context.turnId,
-    requestedByClientId: context.clientId,
+  return resolveCurrentClientWalletAccount(context, {
     chainFamily: toolInput.chainFamily,
     chain: toolInput.chain,
     title: "Wallet setup required",
-    body: `Create a local ${describeChainFamily(toolInput.chainFamily)} wallet on this device to continue this transfer.`
+    body: `Create a local ${describeChainFamily(toolInput.chainFamily)} wallet on this device to continue this transfer.`,
+    missingAddressMessage: "Sender wallet address is missing"
   }).pipe(
     Effect.map((account) => ({
       fromAddress: account.address,
       eligibleDeviceIds: account.eligibleDeviceIds
-    })),
-    Effect.catchAll((error) =>
-      Effect.fail(
-        new Error(
-          `Sender wallet address is missing and no default ${describeChainFamily(toolInput.chainFamily)} wallet account is available: ${error.message}`
-        )
-      )
-    )
+    }))
   );
 };
+
+const resolveTransferAsset = (
+  context: Pick<WalletAgentExecutionContext, "wallet">,
+  toolInput: ParsedTransferToolInput,
+  source: {
+    readonly fromAddress: string;
+  }
+): Effect.Effect<ResolvedTransferAsset, Error> =>
+  Effect.gen(function* () {
+    const chain = resolveTransferChain(toolInput.chain);
+    if (!chain) {
+      return {
+        assetSymbol: toolInput.assetSymbol
+      };
+    }
+
+    if (toolInput.assetSymbol === chain.nativeSymbol) {
+      yield* verifyNativeTransferBalance(context, toolInput, source, chain);
+      return {
+        assetSymbol: toolInput.assetSymbol
+      };
+    }
+
+    if (chain.chainFamily !== "evm") {
+      return yield* Effect.fail(
+        new Error(`Token transfers are not supported on ${toolInput.chain} yet`)
+      );
+    }
+
+    const asset = yield* findErc20TransferAsset(context, toolInput, source, chain);
+    if (asset) {
+      return asset;
+    }
+    return yield* Effect.fail(
+      new Error(`No ${toolInput.assetSymbol} token balance found for ${shortAddress(source.fromAddress)} on ${chain.key}`)
+    );
+  });
+
+const verifyNativeTransferBalance = (
+  context: Pick<WalletAgentExecutionContext, "wallet">,
+  toolInput: ParsedTransferToolInput,
+  source: {
+    readonly fromAddress: string;
+  },
+  chain: TransferChainConfig
+): Effect.Effect<void, Error> =>
+  Effect.gen(function* () {
+    const result = yield* context.wallet.getBalances({
+      kind: "list",
+      address: source.fromAddress,
+      chain: chain.key,
+      assetSymbol: chain.nativeSymbol,
+      includeTokens: false
+    });
+    const balance = result.balances.find((candidate) =>
+      candidate.chain === chain.key &&
+      candidate.isNative === true &&
+      candidate.assetSymbol.toUpperCase() === chain.nativeSymbol
+    );
+    if (!balance) {
+      return yield* Effect.fail(
+        new Error(`No ${chain.nativeSymbol} balance found for ${shortAddress(source.fromAddress)} on ${chain.key}`)
+      );
+    }
+
+    const rawAmount = parseUnits(toolInput.amount, balance.decimals);
+    if (BigInt(balance.rawAmount) < rawAmount) {
+      return yield* Effect.fail(
+        new Error(`Insufficient ${balance.assetSymbol} balance on ${chain.key}: have ${balance.formattedAmount}, need ${toolInput.amount}`)
+      );
+    }
+  });
+
+const findErc20TransferAsset = (
+  context: Pick<WalletAgentExecutionContext, "wallet">,
+  toolInput: ParsedTransferToolInput,
+  source: {
+    readonly fromAddress: string;
+  },
+  chain: EvmChainConfig
+): Effect.Effect<ResolvedTransferAsset | undefined, Error> =>
+  Effect.gen(function* () {
+    const result = yield* context.wallet.getBalances({
+      kind: "list",
+      address: source.fromAddress,
+      chain: chain.key,
+      assetSymbol: toolInput.tokenAddress ? undefined : toolInput.assetSymbol,
+      tokenAddress: toolInput.tokenAddress,
+      includeTokens: true
+    });
+    const balances = result.balances.filter((balance) =>
+      balance.chain === chain.key &&
+      balance.chainFamily === "evm" &&
+      balance.isNative === false &&
+      (
+        toolInput.tokenAddress
+          ? balance.tokenAddress?.toLowerCase() === toolInput.tokenAddress.toLowerCase()
+          : balance.assetSymbol.toUpperCase() === toolInput.assetSymbol
+      )
+    );
+    const tokenAddresses = new Set(
+      balances
+        .map((balance) => balance.tokenAddress?.toLowerCase())
+        .filter((tokenAddress): tokenAddress is string => typeof tokenAddress === "string")
+    );
+
+    if (balances.length === 0 || tokenAddresses.size === 0) {
+      return undefined;
+    }
+
+    if (!toolInput.tokenAddress && tokenAddresses.size > 1) {
+      return yield* Effect.fail(
+        new Error(`${toolInput.assetSymbol} is ambiguous on ${chain.key}; provide tokenAddress`)
+      );
+    }
+
+    const balance = balances[0];
+    if (!balance.tokenAddress) {
+      return yield* Effect.fail(
+        new Error(`${toolInput.assetSymbol} token contract could not be resolved on ${chain.key}`)
+      );
+    }
+
+    const rawAmount = parseUnits(toolInput.amount, balance.decimals);
+    if (BigInt(balance.rawAmount) < rawAmount) {
+      return yield* Effect.fail(
+        new Error(`Insufficient ${balance.assetSymbol} balance on ${chain.key}: have ${balance.formattedAmount}, need ${toolInput.amount}`)
+      );
+    }
+
+    return {
+      assetSymbol: balance.assetSymbol.toUpperCase(),
+      tokenAddress: balance.tokenAddress,
+      tokenDecimals: balance.decimals
+    };
+  });
 
 const resolveSigningSource = (
   context: Pick<WalletAgentExecutionContext, "sessionId" | "turnId" | "clientId" | "wallet">,
@@ -1565,28 +1975,66 @@ const resolveSigningSource = (
     );
   }
 
-  return context.wallet.ensureAccount({
-    sessionId: context.sessionId,
-    turnId: context.turnId,
-    requestedByClientId: context.clientId,
+  return resolveCurrentClientWalletAccount(context, {
     chainFamily: input.chainFamily,
     chain: input.chain,
     title: input.title,
-    body: input.body
+    body: input.body,
+    missingAddressMessage: "Signer wallet address is missing"
   }).pipe(
     Effect.map((account) => ({
       address: account.address,
       eligibleDeviceIds: account.eligibleDeviceIds
-    })),
-    Effect.catchAll((error) =>
-      Effect.fail(
-        new Error(
-          `Signer wallet address is missing and no default ${describeChainFamily(input.chainFamily)} wallet account is available: ${error.message}`
-        )
-      )
-    )
+    }))
   );
 };
+
+const resolveCurrentClientWalletAccount = (
+  context: Pick<WalletAgentExecutionContext, "sessionId" | "turnId" | "clientId" | "wallet">,
+  input: {
+    readonly chainFamily: WalletChainFamily;
+    readonly chain: string;
+    readonly title: string;
+    readonly body: string;
+    readonly missingAddressMessage: string;
+  }
+): Effect.Effect<WalletAccountCandidate, Error> =>
+  Effect.gen(function* () {
+    const currentAccounts = yield* context.wallet.listAccounts({
+      chainFamily: input.chainFamily,
+      chain: input.chain,
+      eligibleDeviceIds: [context.clientId]
+    });
+
+    if (currentAccounts.length === 1) {
+      return currentAccounts[0];
+    }
+
+    if (currentAccounts.length > 1) {
+      const addresses = currentAccounts.map((account) => account.address).join(", ");
+      return yield* Effect.fail(
+        new Error(
+          `${input.missingAddressMessage}; this device has multiple matching ${describeChainFamily(input.chainFamily)} accounts. Specify fromAddress/address. Available addresses: ${addresses}`
+        )
+      );
+    }
+
+    return yield* context.wallet.ensureAccount({
+      sessionId: context.sessionId,
+      turnId: context.turnId,
+      requestedByClientId: context.clientId,
+      chainFamily: input.chainFamily,
+      chain: input.chain,
+      title: input.title,
+      body: input.body
+    }).pipe(
+      Effect.mapError((error) =>
+        new Error(
+          `${input.missingAddressMessage}; no current ${describeChainFamily(input.chainFamily)} wallet account is available on this device: ${error.message}`
+        )
+      )
+    );
+  });
 
 const createTransferResultOutput = (
   transaction: WalletTransactionRecord
@@ -1677,7 +2125,6 @@ const toWalletAccountView = (
   derivationPath: account.derivationPath,
   derivationProfile: account.derivationProfile,
   label: account.label,
-  isDefault: account.isDefault,
   eligibleDeviceIds: account.eligibleDeviceIds
 });
 
@@ -2111,6 +2558,8 @@ const decodePendingTransfer = (value: unknown): PendingTransferRequest => {
     amount: requirePositiveDecimal(record.amount, "pending.amount"),
     fromAddress: requireWalletAddress(record.fromAddress, "pending.fromAddress", chainFamily),
     toAddress: requireWalletAddress(record.toAddress, "pending.toAddress", chainFamily),
+    tokenAddress: optionalTrimmedString(record.tokenAddress),
+    tokenDecimals: optionalNonNegativeInteger(record.tokenDecimals),
     note: optionalTrimmedString(record.note),
     digest: requireNonEmptyString(record.digest, "pending.digest"),
     requestedAt: requireNonEmptyString(record.requestedAt, "pending.requestedAt"),
@@ -2343,11 +2792,13 @@ type WalletAccountQuery =
       readonly kind: "default";
       readonly chainFamily?: WalletChainFamily;
       readonly chain?: string;
+      readonly includeAllConnected?: boolean;
     }
   | {
       readonly kind: "list";
       readonly chainFamily?: WalletChainFamily;
       readonly chain?: string;
+      readonly includeAllConnected?: boolean;
     };
 
 function decodeTransferStatusToolInput(input: unknown): TransferStatusQuery {
@@ -2369,18 +2820,35 @@ function decodeWalletAccountToolInput(input: unknown): WalletAccountQuery {
   return {
     kind: requireWalletAccountQueryKind(record.kind),
     chainFamily: optionalWalletChainFamily(record.chainFamily),
-    chain: optionalTrimmedString(record.chain)
+    chain: optionalTrimmedString(record.chain),
+    includeAllConnected: optionalBoolean(record.includeAllConnected)
+  };
+}
+
+function decodeWalletBalanceToolInput(input: unknown): WalletBalanceQuery {
+  const record = asRecord(input);
+  return {
+    kind: optionalWalletBalanceQueryKind(record.kind) ?? "list",
+    chainFamily: optionalWalletChainFamily(record.chainFamily),
+    chain: optionalTrimmedString(record.chain),
+    address: optionalTrimmedString(record.address),
+    assetSymbol: optionalTrimmedString(record.assetSymbol)?.toUpperCase(),
+    tokenAddress: optionalTrimmedString(record.tokenAddress),
+    includeTokens: optionalBoolean(record.includeTokens) ?? true,
+    includeAllConnected: optionalBoolean(record.includeAllConnected)
   };
 }
 
 const answerWalletAccountQuery = (
-  context: Pick<WalletAgentExecutionContext, "wallet">,
+  context: Pick<WalletAgentExecutionContext, "clientId" | "wallet">,
   query: WalletAccountQuery
 ): Effect.Effect<WalletAccountsResultOutput, Error> =>
   Effect.gen(function* () {
+    const eligibleDeviceIds = query.includeAllConnected ? undefined : [context.clientId];
     const accounts = yield* context.wallet.listAccounts({
       chainFamily: query.chainFamily,
-      chain: query.chain
+      chain: query.chain,
+      eligibleDeviceIds
     });
     const accountViews = accounts.map(toWalletAccountView);
 
@@ -2405,7 +2873,8 @@ const answerWalletAccountQuery = (
     if (query.chainFamily) {
       const resolved = yield* Effect.either(context.wallet.resolveAccount({
         chainFamily: query.chainFamily,
-        chain: query.chain
+        chain: query.chain,
+        eligibleDeviceIds
       }));
 
       if (resolved._tag === "Right") {
@@ -2414,7 +2883,7 @@ const answerWalletAccountQuery = (
           query,
           status: "ok",
           accounts: accountViews,
-          defaultAccount: toWalletAccountView(resolved.right)
+          currentAccount: toWalletAccountView(resolved.right)
         };
       }
 
@@ -2434,7 +2903,7 @@ const answerWalletAccountQuery = (
           query,
           status: "ok",
           accounts: accountViews,
-          defaultAccount: toWalletAccountView(representatives[0])
+          currentAccount: toWalletAccountView(representatives[0])
         };
       }
 
@@ -2454,12 +2923,31 @@ const answerWalletAccountQuery = (
     };
   });
 
+const answerWalletBalanceQuery = (
+  context: Pick<WalletAgentExecutionContext, "clientId" | "wallet">,
+  query: WalletBalanceQuery
+): Effect.Effect<WalletBalancesResultOutput, Error> =>
+  Effect.gen(function* () {
+    const { includeAllConnected: _includeAllConnected, ...hostQuery } = query;
+    const scopedQuery = (query.address || query.includeAllConnected
+      ? hostQuery
+      : {
+          ...hostQuery,
+          eligibleDeviceIds: [context.clientId]
+        }) as WalletBalanceRequest;
+    const result = yield* context.wallet.getBalances(scopedQuery);
+    return {
+      kind: "wallet.balances_result",
+      ...result
+    };
+  });
+
 const renderNoWalletAccountMessage = (query: WalletAccountQuery): string =>
   query.chainFamily
     ? `No ${describeChainFamily(query.chainFamily)} wallet is connected yet. Create or import a wallet on this device, or connect another wallet-capable client, and I'll be able to resolve it automatically.`
     : "No wallet is connected yet. Create or import a wallet on this device, or connect another wallet-capable client, and I'll be able to resolve it automatically.";
 
-const renderDefaultWalletAccountMessage = (
+const renderCurrentWalletAccountMessage = (
   account: WalletAccountCandidate,
   query: WalletAccountQuery
 ): string => {
@@ -2503,7 +2991,6 @@ const describeWalletAccountScope = (
 const describeWalletAccount = (account: WalletAccountCandidate): string => {
   const parts = [
     describeChainFamily(account.chainFamily),
-    account.isDefault === true ? "default" : undefined,
     account.label ? `(${account.label})` : undefined,
     account.address
   ].filter((part): part is string => typeof part === "string" && part.length > 0);
@@ -2523,12 +3010,6 @@ const representativeWalletAccounts = (
 
   const representatives: WalletAccountCandidate[] = [];
   for (const familyAccounts of families.values()) {
-    const defaults = familyAccounts.filter((account) => account.isDefault === true);
-    if (defaults.length === 1) {
-      representatives.push(defaults[0]);
-      continue;
-    }
-
     if (familyAccounts.length === 1) {
       representatives.push(familyAccounts[0]);
       continue;
@@ -3174,6 +3655,8 @@ const defaultChainNameForChainId = (chainId: number): string => {
   switch (chainId) {
     case 1:
       return "ethereum";
+    case 8453:
+      return "base";
     case 11155111:
       return "sepolia";
     case 137:
@@ -3189,6 +3672,11 @@ const defaultChainIdForChainName = (chain: string): number => {
     case "mainnet":
     case "eth":
       return 1;
+    case "base":
+    case "base-mainnet":
+    case "base-eth":
+    case "eth-base":
+      return 8453;
     case "sepolia":
       return 11155111;
     case "polygon":
@@ -3612,6 +4100,29 @@ const requireWalletAccountQueryKind = (
   }
 };
 
+const requireWalletBalanceQueryKind = (
+  value: unknown
+): WalletBalanceQueryKind => {
+  const normalized = requireNonEmptyString(value, "kind");
+  switch (normalized) {
+    case "default":
+    case "list":
+      return normalized;
+    default:
+      throw new Error(`Unsupported wallet balance query kind: ${normalized}`);
+  }
+};
+
+const optionalWalletBalanceQueryKind = (
+  value: unknown
+): WalletBalanceQueryKind | undefined => {
+  if (value === undefined) {
+    return undefined;
+  }
+
+  return requireWalletBalanceQueryKind(value);
+};
+
 const requireManageContactsOperation = (
   value: unknown
 ): ManageContactsInput["operation"] => {
@@ -3698,6 +4209,26 @@ const optionalPositiveInteger = (value: unknown): number | undefined => {
   }
 
   return requirePositiveInteger(value, "value");
+};
+
+const optionalNonNegativeInteger = (value: unknown): number | undefined => {
+  if (value === undefined || value === null || value === "") {
+    return undefined;
+  }
+
+  return requirePositiveInteger(value, "value");
+};
+
+const optionalBoolean = (value: unknown): boolean | undefined => {
+  if (value === undefined || value === null) {
+    return undefined;
+  }
+
+  if (typeof value === "boolean") {
+    return value;
+  }
+
+  throw new Error("value must be a boolean");
 };
 
 const optionalKeyAlgorithm = (value: unknown): "secp256k1" | "ed25519" | undefined => {
